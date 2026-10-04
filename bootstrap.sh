@@ -211,13 +211,21 @@ publish_key() {
     return
   fi
 
+  if gh_publish; then
+    info "published as $(hostname -s)"
+  else
+    # Inbound SSH already works at this point, so a trusted machine can finish the job.
+    warn "could not publish the key automatically. Add $KEY.pub at https://github.com/settings/ssh/new, or from a trusted machine: ssh $(hostname -s) cat .ssh/id_ed25519.pub | gh ssh-key add - --title $(hostname -s)"
+  fi
+}
+
+gh_publish() {
   if ! command -v gh > /dev/null; then
     info "installing GitHub CLI"
     if [ "$OS" = Darwin ]; then
-      command -v brew > /dev/null || die "install Homebrew or the GitHub CLI (gh), then re-run"
-      brew install gh
+      command -v brew > /dev/null && brew install gh || return 1
     else
-      install_pkg gh
+      install_pkg gh || return 1
     fi
   fi
 
@@ -225,13 +233,15 @@ publish_key() {
   # Global so the EXIT trap can still see it after this function returns.
   GH_TMP="$(mktemp -d)"
   trap 'rm -rf "$GH_TMP"' EXIT
+  local status=0
   info "log in to GitHub: enter the code it prints at https://github.com/login/device"
   env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$GH_TMP" gh auth login \
     --hostname github.com --git-protocol ssh --skip-ssh-key --web --insecure-storage \
-    --scopes admin:public_key < /dev/tty
-  env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$GH_TMP" gh ssh-key add "$KEY.pub" --title "$(hostname -s)"
+    --scopes admin:public_key < /dev/tty \
+    && env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$GH_TMP" gh ssh-key add "$KEY.pub" --title "$(hostname -s)" \
+    || status=$?
   env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$GH_TMP" gh auth logout --hostname github.com > /dev/null 2>&1 || true
-  info "published as $(hostname -s)"
+  return "$status"
 }
 
 main() {
