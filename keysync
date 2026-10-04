@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# keysync: mirror the SSH public keys published on GitHub into ~/.ssh/authorized_keys.
+#
+#   keysync         sync this machine now
+#   keysync --all   sync this machine, then every online tailnet peer over SSH
+#
+# Only the block between the keysync markers is managed; keys added by hand are kept.
+set -euo pipefail
+
+GITHUB_USER="${KEYSYNC_GITHUB_USER:-peraltafederico}"
+AUTH_KEYS="${KEYSYNC_AUTHORIZED_KEYS:-$HOME/.ssh/authorized_keys}"
+KEYS_URL="https://github.com/$GITHUB_USER.keys"
+BEGIN_MARK="# >>> keysync: $KEYS_URL >>>"
+END_MARK="# <<< keysync <<<"
+# Anything that is not one of these key types means GitHub sent something unexpected.
+KEY_LINE='^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) '
+
+log() { printf 'keysync: %s\n' "$*" >&2; }
+
+usage() {
+  sed -n '2,7s/^# \{0,1\}//p' "$0"
+}
+
+sync_local() {
+  local keys tmp auth_dir
+  if ! keys="$(curl -fsSL --max-time 20 "$KEYS_URL")"; then
+    log "could not fetch $KEYS_URL, keeping current keys"
+    return 1
+  fi
+  # An empty or malformed response must never replace working keys, or an outage locks us out.
+  local response_invalid=false
+  if [ -z "$keys" ] || printf '%s\n' "$keys" | grep -Evq "$KEY_LINE"; then
+    response_invalid=true
+  fi
+  if $response_invalid; then
+    log "unexpected response from $KEYS_URL, keeping current keys"
+    return 1
+  fi
+
+  auth_dir="$(dirname "$AUTH_KEYS")"
+  mkdir -p "$auth_dir"
+  chmod 700 "$auth_dir"
+  touch "$AUTH_KEYS"
+  tmp="$(mktemp "$AUTH_KEYS.XXXXXX")"
+  {
+    awk -v b="$BEGIN_MARK" -v e="$END_MARK" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$AUTH_KEYS"
+    printf '%s\n' "$BEGIN_MARK" "$keys" "$END_MARK"
+  } > "$tmp"
+  chmod 600 "$tmp"
+
+  local count
+  count="$(printf '%s\n' "$keys" | wc -l | tr -d ' ')"
+  if cmp -s "$tmp" "$AUTH_KEYS"; then
+    rm -f "$tmp"
+    log "up to date ($count keys)"
+  else
+    mv "$tmp" "$AUTH_KEYS"
+    log "updated ($count keys)"
+  fi
+}
+
+tailscale_cli() {
+  if command -v tailscale > /dev/null 2>&1; then
+    command -v tailscale
+  elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    echo /Applications/Tailscale.app/Contents/MacOS/Tailscale
+  else
+    return 1
+  fi
+}
+
+sync_all() {
+  local ts peers peer status failed=0
+  sync_local || failed=1
+
+  if ! ts="$(tailscale_cli)"; then
+    log "tailscale CLI not found, cannot reach peers"
+    return 1
+  fi
+  # Columns: ip, name, user, os, status. Phones have no SSH server, offline peers cannot answer.
+  peers="$("$ts" status --self=false | awk '$1 ~ /^100\./ && $4 != "android" && $4 != "iOS" && $0 !~ /offline/ { print $2 }')"
+
+  for peer in $peers; do
+    # The tailnet already authenticates peers, so trusting a host key on first contact is safe here.
+    if ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+      "$peer" '"$HOME/.local/bin/keysync"' 2> /dev/null; then
+      log "$peer: synced"
+    else
+      status=$?
+      failed=1
+      case "$status" in
+        127) log "$peer: keysync not installed (run bootstrap.sh there)" ;;
+        255) log "$peer: SSH failed (no SSH server, or it does not trust this machine yet)" ;;
+        *) log "$peer: keysync failed (exit $status)" ;;
+      esac
+    fi
+  done
+  return "$failed"
+}
+
+case "${1:-}" in
+  "") sync_local ;;
+  --all) sync_all ;;
+  -h | --help) usage ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
