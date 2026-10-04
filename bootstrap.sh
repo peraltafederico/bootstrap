@@ -240,8 +240,12 @@ main() {
     Linux | Darwin) ;;
     *) die "unsupported OS: $OS" ;;
   esac
-  # shellcheck disable=SC2024 # the redirect is for the password prompt, not a file sudo must read
-  [ "$OS" = Darwin ] || sudo -v < /dev/tty
+  # Ask for the password up front, unless sudo already works without one. Plain `sudo -v` would
+  # prompt even with NOPASSWD rules when any other rule (like the sudo group) still needs a password.
+  if [ "$OS" = Linux ] && ! sudo -n true 2> /dev/null; then
+    # shellcheck disable=SC2024 # the redirect is for the password prompt, not a file sudo must read
+    sudo -v < /dev/tty
+  fi
 
   ensure_tailscale
   ensure_ssh_server
