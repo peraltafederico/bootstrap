@@ -261,6 +261,45 @@ gh_publish() {
   return "$status"
 }
 
+require_ssh_keys() {
+  step "Key-only SSH"
+  local conf=/etc/ssh/sshd_config.d/10-keys-only.conf
+  local wanted='PasswordAuthentication no
+KbdInteractiveAuthentication no'
+  # Turning passwords off before any trusted key is in place would lock everyone out.
+  local keys_in_place=false
+  if grep -q '^# >>> keysync' "$HOME/.ssh/authorized_keys" 2> /dev/null \
+    && grep -Eq '^(ssh-|ecdsa-|sk-)' "$HOME/.ssh/authorized_keys"; then
+    keys_in_place=true
+  fi
+  if ! $keys_in_place; then
+    warn "no synced keys yet: leaving SSH password login on, re-run once keysync works"
+    return
+  fi
+
+  if [ "$(sudo cat "$conf" 2> /dev/null)" = "$wanted" ]; then
+    info "already on"
+    return
+  fi
+  printf '%s\n' "$wanted" | sudo tee "$conf" > /dev/null
+  sudo chmod 644 "$conf"
+  # A broken config would keep sshd from starting, so validate before it takes effect.
+  if ! sudo sshd -t; then
+    sudo rm -f "$conf"
+    warn "sshd rejected the key-only config, so it was removed and password login stays on"
+    return
+  fi
+  # macOS starts sshd per connection, so only Linux needs a reload.
+  if [ "$OS" = Linux ]; then
+    if [ ! -d /run/systemd/system ]; then
+      warn "no systemd here: restart sshd yourself to apply key-only login"
+      return
+    fi
+    sudo systemctl reload ssh 2> /dev/null || sudo systemctl reload sshd
+  fi
+  info "SSH password login is off, keys only"
+}
+
 main() {
   [ "$(id -u)" -ne 0 ] || die "run as your normal user, not root (keys belong to your account)"
   case "$OS" in
@@ -280,6 +319,7 @@ main() {
   install_keysync
   ensure_key
   publish_key
+  require_ssh_keys
 
   step "Done"
   info "Other machines accept this one within 15 minutes. To do it now, run this"
