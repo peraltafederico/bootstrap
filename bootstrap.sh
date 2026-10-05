@@ -15,6 +15,9 @@ KEY="$HOME/.ssh/id_ed25519"
 OS="$(uname -s)"
 # $USER is not set in every context (containers, some service shells).
 ME="$(id -un)"
+# Minimal installs may lack `hostname`; uname works everywhere.
+HOST="$(uname -n)"
+HOST="${HOST%%.*}"
 WARNINGS=()
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -99,6 +102,20 @@ ensure_ssh_server() {
   # Debian names the unit ssh, Fedora and Arch name it sshd.
   sudo systemctl enable --now ssh 2> /dev/null || sudo systemctl enable --now sshd
   info "running and enabled at boot"
+
+}
+
+allow_ssh_in_firewall() {
+  # When ufw denies incoming traffic, open SSH on the tailnet only, not on whatever Wi-Fi a
+  # laptop happens to join.
+  local ufw_active=false
+  if command -v ufw > /dev/null && sudo ufw status 2> /dev/null | grep -q '^Status: active'; then
+    ufw_active=true
+  fi
+  if $ufw_active; then
+    sudo ufw allow in on tailscale0 to any port 22 proto tcp comment 'SSH over tailnet' > /dev/null
+    info "ufw: allowed SSH on tailscale0 only"
+  fi
 }
 
 install_keysync() {
@@ -197,7 +214,7 @@ ensure_key() {
   else
     mkdir -p "$HOME/.ssh"
     chmod 700 "$HOME/.ssh"
-    ssh-keygen -q -t ed25519 -N "" -C "$ME@$(hostname -s)" -f "$KEY"
+    ssh-keygen -q -t ed25519 -N "" -C "$ME@$HOST" -f "$KEY"
     info "generated $KEY"
   fi
 }
@@ -212,10 +229,10 @@ publish_key() {
   fi
 
   if gh_publish; then
-    info "published as $(hostname -s)"
+    info "published as $HOST"
   else
     # Inbound SSH already works at this point, so a trusted machine can finish the job.
-    warn "could not publish the key automatically. Add $KEY.pub at https://github.com/settings/ssh/new, or from a trusted machine: ssh $(hostname -s) cat .ssh/id_ed25519.pub | gh ssh-key add - --title $(hostname -s)"
+    warn "could not publish the key automatically. Add $KEY.pub at https://github.com/settings/ssh/new, or from a trusted machine: ssh $HOST cat .ssh/id_ed25519.pub | gh ssh-key add - --title $HOST"
   fi
 }
 
@@ -238,7 +255,7 @@ gh_publish() {
   env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$GH_TMP" gh auth login \
     --hostname github.com --git-protocol ssh --skip-ssh-key --web --insecure-storage \
     --scopes admin:public_key < /dev/tty \
-    && env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$GH_TMP" gh ssh-key add "$KEY.pub" --title "$(hostname -s)" \
+    && env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$GH_TMP" gh ssh-key add "$KEY.pub" --title "$HOST" \
     || status=$?
   env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$GH_TMP" gh auth logout --hostname github.com > /dev/null 2>&1 || true
   return "$status"
@@ -259,6 +276,7 @@ main() {
 
   ensure_tailscale
   ensure_ssh_server
+  [ "$OS" = Darwin ] || allow_ssh_in_firewall
   install_keysync
   ensure_key
   publish_key
