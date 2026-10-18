@@ -88,20 +88,25 @@ nudge() {
   fi
   domain="gui/$(id -u)"
   plist="$HOME/Library/LaunchAgents/$NUDGE_LABEL.plist"
-  if [ ! -f "$plist" ]; then
-    mkdir -p "$(dirname "$plist")"
-    cat > "$plist" << PLIST
+  # launchd delays restarts of a job by 10s by default, which stalled back-to-back wakes.
+  want=$(cat << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>$NUDGE_LABEL</string>
   <key>ProgramArguments</key><array><string>$NUDGE_BIN</string><string>$NUDGE_STATUS</string></array>
+  <key>ThrottleInterval</key><integer>1</integer>
 </dict></plist>
 PLIST
+)
+  if [ "$(cat "$plist" 2> /dev/null)" != "$want" ]; then
+    mkdir -p "$(dirname "$plist")"
+    printf "%s\n" "$want" > "$plist"
+    launchctl bootout "$domain/$NUDGE_LABEL" 2> /dev/null
   fi
   launchctl print "$domain/$NUDGE_LABEL" > /dev/null 2>&1 || launchctl bootstrap "$domain" "$plist"
   rm -f "$NUDGE_STATUS"
-  launchctl kickstart -k "$domain/$NUDGE_LABEL"
+  launchctl kickstart "$domain/$NUDGE_LABEL"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -s "$NUDGE_STATUS" ] && break
     sleep 0.3
