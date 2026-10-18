@@ -118,26 +118,31 @@ allow_ssh_in_firewall() {
   fi
 }
 
-install_keysync() {
-  step "keysync"
+# Installs a script from this repo into $BIN_DIR: the local checkout when run from one, else GitHub.
+install_tool() {
+  local name=$1 here="" tmp
   mkdir -p "$BIN_DIR"
-  local here="" tmp
   if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   fi
-  if [ -n "$here" ] && [ -f "$here/keysync" ]; then
-    install -m 755 "$here/keysync" "$BIN_DIR/keysync"
+  if [ -n "$here" ] && [ -f "$here/$name" ]; then
+    install -m 755 "$here/$name" "$BIN_DIR/$name"
   else
     tmp="$(mktemp)"
-    curl -fsSL "$RAW_URL/keysync" -o "$tmp"
-    install -m 755 "$tmp" "$BIN_DIR/keysync"
+    curl -fsSL "$RAW_URL/$name" -o "$tmp"
+    install -m 755 "$tmp" "$BIN_DIR/$name"
     rm -f "$tmp"
   fi
-  info "installed $BIN_DIR/keysync"
+  info "installed $BIN_DIR/$name"
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
-    *) warn "$BIN_DIR is not on PATH: add it to your shell profile to run keysync by name" ;;
+    *) warn "$BIN_DIR is not on PATH: add it to your shell profile to run $name by name" ;;
   esac
+}
+
+install_keysync() {
+  step "keysync"
+  install_tool keysync
 
   if [ "$OS" = Darwin ]; then
     schedule_launchd
@@ -317,6 +322,8 @@ main() {
   ensure_ssh_server
   [ "$OS" = Darwin ] || allow_ssh_in_firewall
   install_keysync
+  step "wake"
+  install_tool wake
   ensure_key
   publish_key
   require_ssh_keys
