@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# wake: turn on the displays of tailnet computers over SSH, and report which devices answer.
+#
+#   wake                   wake every computer on the tailnet
+#   wake mini lenovo       wake only peers whose name contains one of these words
+#   wake --for 30m         keep the displays on this long (default 10m; s, m or h)
+#   wake --ping [word...]  report reachability and display state without waking
+#
+# Phones answer --ping but cannot be woken remotely.
+set -euo pipefail
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+
+usage() {
+  sed -n '2,9s/^# \{0,1\}//p' "$0"
+}
+
+die() {
+  printf 'wake: %s\n' "$*" >&2
+  exit 2
+}
+
+tailscale_cli() {
+  if command -v tailscale > /dev/null 2>&1; then
+    command -v tailscale
+  elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    echo /Applications/Tailscale.app/Contents/MacOS/Tailscale
+  else
+    return 1
+  fi
+}
+
+# Runs on the target as: sh <script> <wake|ping> <seconds> <label>. Prints one status line.
+# Holding the display on matters: both macOS and GNOME wake the screen without resetting the
+# idle timer, so a bare wake goes dark again within seconds unless real input arrives.
+# shellcheck disable=SC2016 # expanded on the target, not here
+REMOTE_SCRIPT='
+mode=$1 secs=$2 label=$3
+pidfile="$HOME/.cache/wake-hold.pid"
+
+# One hold per machine: a new wake replaces the previous one instead of stacking.
+hold() {
+  mkdir -p "$HOME/.cache"
+  [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2> /dev/null
+  nohup "$@" < /dev/null > /dev/null 2>&1 &
+  echo $! > "$pidfile"
+}
+
+# External monitors on Apple Silicon stay dark until real input arrives, even after macOS
+# reports the display on. Synthetic input only counts when posted from the GUI session by a
+# process with the Accessibility permission, so a LaunchAgent runs this helper on demand.
+NUDGE_SRC=$(cat << "SWIFT"
+import ApplicationServices
+let statusFile = CommandLine.arguments[1]
+let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+let trusted = AXIsProcessTrustedWithOptions(prompt)
+if trusted, let here = CGEvent(source: nil)?.location {
+  let source = CGEventSource(stateID: .hidSystemState)
+  for point in [CGPoint(x: here.x + 1, y: here.y), here] {
+    CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
+      .post(tap: .cghidEventTap)
+  }
+}
+try? (trusted ? "ok" : "untrusted").write(toFile: statusFile, atomically: true, encoding: .utf8)
+SWIFT
+)
+NUDGE_LABEL=com.peraltafederico.wake-nudge
+NUDGE_BIN="$HOME/.local/libexec/wake-nudge"
+NUDGE_STATUS="$HOME/.cache/wake-nudge.status"
+NUDGE_ALLOW="allow wake-nudge once in System Settings > Privacy & Security > Accessibility, or the monitor stays dark"
+
+# Prints nothing on success, or why the nudge could not run.
+nudge() {
+  if [ "$(stat -f%Su /dev/console)" != "$(id -un)" ]; then
+    echo "nobody is logged in at the screen"
+    return
+  fi
+  # Rebuilding changes the binary signature and voids the Accessibility grant, so build only on change.
+  hash=$(printf "%s" "$NUDGE_SRC" | shasum | cut -c1-40)
+  if [ ! -x "$NUDGE_BIN" ] || [ "$(cat "$NUDGE_BIN.hash" 2> /dev/null)" != "$hash" ]; then
+    mkdir -p "$(dirname "$NUDGE_BIN")"
+    printf "%s\n" "$NUDGE_SRC" > "$NUDGE_BIN.swift"
+    if ! xcrun swiftc -O -o "$NUDGE_BIN" "$NUDGE_BIN.swift" < /dev/null > /dev/null 2>&1; then
+      echo "could not build the input helper (install Xcode Command Line Tools: xcode-select --install)"
+      return
+    fi
+    echo "$hash" > "$NUDGE_BIN.hash"
+  fi
+  domain="gui/$(id -u)"
+  plist="$HOME/Library/LaunchAgents/$NUDGE_LABEL.plist"
+  if [ ! -f "$plist" ]; then
+    mkdir -p "$(dirname "$plist")"
+    cat > "$plist" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$NUDGE_LABEL</string>
+  <key>ProgramArguments</key><array><string>$NUDGE_BIN</string><string>$NUDGE_STATUS</string></array>
+</dict></plist>
+PLIST
+  fi
+  launchctl print "$domain/$NUDGE_LABEL" > /dev/null 2>&1 || launchctl bootstrap "$domain" "$plist"
+  rm -f "$NUDGE_STATUS"
+  launchctl kickstart -k "$domain/$NUDGE_LABEL"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$NUDGE_STATUS" ] && break
+    sleep 0.3
+  done
+  case "$(cat "$NUDGE_STATUS" 2> /dev/null)" in
+    ok) ;;
+    untrusted) echo "$NUDGE_ALLOW" ;;
+    *) echo "the input helper did not report back" ;;
+  esac
+}
+
+darwin() {
+  state=$(pmset -g log | grep -oE "Display is turned (on|off)" | tail -1 | cut -d" " -f4)
+  sleep_min=$(pmset -g | awk "\$1 == \"sleep\" { print \$2 }")
+  note=""
+  if [ "${sleep_min:-0}" != 0 ]; then
+    note="; system sleeps after ${sleep_min}m idle and then drops off the tailnet (fix: sudo pmset -c sleep 0)"
+  fi
+  if [ "$mode" = ping ]; then
+    [ "$(cat "$NUDGE_STATUS" 2> /dev/null)" = untrusted ] && note="; $NUDGE_ALLOW$note"
+    echo "display ${state:-unknown}$note"
+    return
+  fi
+  hold caffeinate -u -d -t "$secs"
+  problem=$(nudge)
+  [ -n "$problem" ] && note="; $problem$note"
+  echo "display on for $label (was ${state:-unknown})$note"
+}
+
+gnome() {
+  dest=$1 obj=$2 method=$3
+  shift 3
+  gdbus call --session --dest "$dest" --object-path "$obj" --method "$method" "$@"
+}
+
+linux() {
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+  if ! command -v gdbus > /dev/null 2>&1 \
+    || ! gnome org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver.GetActive > /dev/null 2>&1; then
+    echo "no GNOME desktop session to wake"
+    return
+  fi
+  # PowerSaveMode 0 means the monitors are on; anything else is a blanked or off state.
+  psm=$(gnome org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/DisplayConfig \
+    org.freedesktop.DBus.Properties.Get org.gnome.Mutter.DisplayConfig PowerSaveMode)
+  case "$psm" in *"<0>"*) state=on ;; *) state=off ;; esac
+  if [ "$mode" = ping ]; then
+    echo "display $state"
+    return
+  fi
+  hold timeout "$secs" gnome-session-inhibit --inhibit idle --inhibit-only
+  # Power the monitors through Mutter only. ScreenSaver.SetActive false would also unlock the session.
+  gnome org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/DisplayConfig \
+    org.freedesktop.DBus.Properties.Set org.gnome.Mutter.DisplayConfig PowerSaveMode "<0>" > /dev/null
+  echo "display on for $label (was $state)"
+}
+
+case "$(uname -s)" in
+  Darwin) darwin ;;
+  Linux) linux ;;
+  *) echo "unsupported OS: $(uname -s)" ;;
+esac
+'
+
+# Prints one status line for a peer. Args: tailnet IP, OS, status column text.
+# Peers are reached by IP because MagicDNS names do not resolve on every machine.
+check_peer() {
+  local ip=$1 os=$2 status=$3 out rc
+  case "$status" in
+    offline*)
+      echo "offline (${status#offline, })"
+      return
+      ;;
+  esac
+
+  if [ "$os" = iOS ] || [ "$os" = android ]; then
+    if "$TS" ping -c 1 --timeout 3s "$ip" > /dev/null 2>&1; then
+      echo "phone, reachable; phones cannot be woken remotely"
+    else
+      echo "phone, not answering (Tailscale may be paused in the background)"
+    fi
+    return
+  fi
+
+  rc=0
+  # Save the script before running it, so no command inside can consume the rest of it from stdin.
+  # shellcheck disable=SC2029 # the arguments are validated words, expanded here on purpose
+  out="$(ssh "${SSH_OPTS[@]}" "$ip" \
+    "f=\$(mktemp) && cat > \"\$f\" && sh \"\$f\" $MODE $SECONDS_ON $LABEL; rc=\$?; rm -f \"\$f\"; exit \$rc" \
+    <<< "$REMOTE_SCRIPT" 2> /dev/null)" || rc=$?
+  if [ "$rc" = 0 ]; then
+    echo "$out"
+  elif [ "$rc" != 255 ]; then
+    echo "SSH worked but the wake commands failed (exit $rc)"
+  elif "$TS" ping -c 1 --timeout 3s "$ip" > /dev/null 2>&1; then
+    echo "reachable, but SSH failed (Remote Login off, or this machine is not trusted yet: run keysync --all)"
+  else
+    echo "not answering: asleep or offline"
+  fi
+}
+
+MODE=wake
+LABEL=10m
+FILTERS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ping) MODE=ping ;;
+    --for)
+      [ $# -ge 2 ] || die "--for needs a duration, such as 30m"
+      LABEL=$2
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage >&2
+      exit 2
+      ;;
+    *) FILTERS+=("$1") ;;
+  esac
+  shift
+done
+
+[[ "$LABEL" =~ ^([0-9]+)([smh]?)$ ]] || die "invalid duration '$LABEL' (use 90s, 30m or 2h)"
+case "${BASH_REMATCH[2]}" in
+  h) SECONDS_ON=$((BASH_REMATCH[1] * 3600)) ;;
+  m) SECONDS_ON=$((BASH_REMATCH[1] * 60)) ;;
+  *) SECONDS_ON=${BASH_REMATCH[1]} ;;
+esac
+[ "$SECONDS_ON" -gt 0 ] || die "duration must be greater than zero"
+
+TS="$(tailscale_cli)" || die "tailscale CLI not found"
+# Columns: ip, name, user, os, then free-form status ("active; direct ...", "offline, last seen 8d ago", "-").
+peers="$("$TS" status --self=false | awk '$1 ~ /^100\./ {
+  status = $0; sub(/^([^ ]+ +){4}/, "", status); sub(/ +$/, "", status)
+  print $2 "\t" $4 "\t" $1 "\t" status
+}')"
+
+# Name matching ignores case. Bash 3.2 (macOS) has no ${var,,}, and errors on "${empty[@]}" under set -u.
+shopt -s nocasematch
+selected=()
+while IFS=$'\t' read -r name os ip status; do
+  [ -n "$name" ] || continue
+  if [ ${#FILTERS[@]} -eq 0 ]; then
+    selected+=("$name"$'\t'"$os"$'\t'"$ip"$'\t'"$status")
+    continue
+  fi
+  for f in "${FILTERS[@]}"; do
+    if [[ "$name" == *"$f"* ]]; then
+      selected+=("$name"$'\t'"$os"$'\t'"$ip"$'\t'"$status")
+      break
+    fi
+  done
+done <<< "$peers"
+
+names="$(cut -f1 <<< "$peers")"
+for f in ${FILTERS[@]+"${FILTERS[@]}"}; do
+  [[ "$names" == *"$f"* ]] || die "no tailnet peer matches '$f'"
+done
+[ ${#selected[@]} -gt 0 ] || die "no tailnet peers found"
+
+# Check every peer at once so one asleep machine's SSH timeout does not delay the rest.
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+for i in "${!selected[@]}"; do
+  IFS=$'\t' read -r name os ip status <<< "${selected[$i]}"
+  check_peer "$ip" "$os" "$status" > "$tmp/$i" &
+done
+wait
+
+for i in "${!selected[@]}"; do
+  printf '%-26s %s\n' "${selected[$i]%%$'\t'*}" "$(cat "$tmp/$i")"
+done

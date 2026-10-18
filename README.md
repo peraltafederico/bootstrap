@@ -31,6 +31,28 @@ keysync --all    # sync this machine and every online tailnet peer
 Run `keysync --all` from a machine that is already trusted. A freshly
 reinstalled machine cannot do it, since the others don't accept its new key yet.
 
+## Waking sleeping screens
+
+```sh
+wake                 # turn on the monitors of every computer on the tailnet
+wake mini desktop    # only peers whose name contains one of these words
+wake --for 30m       # keep them on this long (default 10m)
+wake --ping          # report what answers and which displays are on, without waking
+```
+
+It runs over SSH, so it reaches every machine the mesh trusts. Locked screens stay
+locked: you get the lock screen, not the desktop. Phones answer `--ping` but cannot be
+woken remotely.
+
+- macOS: external monitors stay dark until real input arrives, so `wake` builds a small
+  `wake-nudge` helper on first use (needs Xcode Command Line Tools) and posts a 1 pixel
+  mouse nudge with it. Allow `wake-nudge` once in System Settings > Privacy & Security >
+  Accessibility on each Mac; `wake` reminds you until you do.
+- A Mac in full system sleep is off the tailnet and cannot be reached. `wake` warns when a
+  Mac is set to system-sleep; `sudo pmset -c sleep 0` keeps it awake on power while the
+  display still sleeps.
+- Linux: GNOME only (X11 or Wayland).
+
 ## Removing a machine
 
 Delete its key at <https://github.com/settings/keys>. Every machine drops it on
