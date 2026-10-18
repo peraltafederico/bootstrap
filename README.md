@@ -73,9 +73,17 @@ Codex reads the same files through two relative links, so new skills need no ext
 ~/.codex/skills    -> ../.claude/skills
 ```
 
-Pair a new machine once: bootstrap prints two commands to run on a machine that
-already syncs, then run the same two here with that machine's id (`syncthing device-id`),
-name and tailnet IP. The Air MacBook stays out: the step skips tailnet names listed
+A new machine joins receive-only, so the copy already syncing wins:
+
+1. Run bootstrap. It prints two commands: run them on a machine that already syncs,
+   then the same two here with that machine's id (`syncthing device-id`), tailnet
+   name and IP.
+2. Once they connect, re-run bootstrap. After the first sync it reverts this machine's
+   differing files to the synced copy (its own versions go to `~/.claude/.stversions`)
+   and switches the folder to send-receive.
+
+The very first machine of a fresh setup has nobody to sync from; start it with
+`syncthing cli config folders claude type set sendreceive`. The Air MacBook stays out: the step skips tailnet names listed
 in `AGENT_SYNC_SKIP_HOSTS` at the top of `bootstrap.sh`, and it is never paired.
 `BOOTSTRAP_AGENT_SYNC=0` skips the step on any machine and `BOOTSTRAP_AGENT_SYNC=1`
 forces it on a listed one.

@@ -23,6 +23,7 @@ HOST="${HOST%%.*}"
 WARNINGS=()
 # Tailnet names that never get agent config sync: the Air MacBook is a work machine.
 AGENT_SYNC_SKIP_HOSTS="airs-macbook-pro"
+ST_FOLDER=claude
 
 step() { printf '\n==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -378,6 +379,52 @@ link_codex() {
   link_relative ../.claude/skills "$skills"
 }
 
+# Calls Syncthing's REST API, which has the revert action the CLI lacks.
+st_api() {
+  local path=$1
+  shift
+  curl -fsS -H "X-API-Key: $(syncthing cli config gui apikey get)" \
+    "http://$(syncthing cli config gui raw-address get)/rest/$path" "$@"
+}
+
+# Prints a top-level field of a flat JSON object, without needing jq.
+json_field() { grep -oE "\"$1\": *(\"[^\"]*\"|[0-9]+)" | head -1 | sed -E 's/.*: *"?([^"]*)"?/\1/'; }
+
+# A joining machine starts receive-only so the existing copy wins. Once a peer's index has
+# arrived and everything is pulled, local differences are reverted (moved to .stversions)
+# and the folder starts sending too. Returns 1 while still waiting for the first sync.
+finish_join() {
+  local self=$1 peer status tries=0 synced=false
+  [ "$(syncthing cli config folders "$ST_FOLDER" type get)" = receiveonly ] || return 0
+  for peer in $(syncthing cli config folders "$ST_FOLDER" devices list); do
+    [ "$peer" = "$self" ] && continue
+    if [ "$(st_api "db/completion?folder=$ST_FOLDER&device=$peer" | json_field remoteState)" = valid ]; then
+      synced=true
+    fi
+  done
+  status="$(st_api "db/status?folder=$ST_FOLDER")"
+  if ! $synced || [ "$(json_field state <<< "$status")" != idle ] || [ "$(json_field needTotalItems <<< "$status")" != 0 ]; then
+    return 1
+  fi
+
+  info "first sync done: replacing this machine's differing files with the synced copy"
+  st_api "db/revert?folder=$ST_FOLDER" -X POST
+  # Switching to send-receive before the revert finishes would push the local versions out.
+  until status="$(st_api "db/status?folder=$ST_FOLDER")" \
+    && [ "$(json_field state <<< "$status")" = idle ] \
+    && [ "$(json_field needTotalItems <<< "$status")" = 0 ] \
+    && [ "$(json_field receiveOnlyChangedFiles <<< "$status")" = 0 ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 120 ]; then
+      warn "the revert did not finish in 2 minutes, re-run bootstrap to complete the join"
+      return 0
+    fi
+    sleep 1
+  done
+  syncthing cli config folders "$ST_FOLDER" type set sendreceive
+  info "joined: this machine now sends changes too (its old versions are in ~/.claude/.stversions)"
+}
+
 # Shares ~/.claude's portable config (CLAUDE.md, skills, agents, memories) with the other machines.
 ensure_agent_sync() {
   step "Agent config sync (Syncthing)"
@@ -419,11 +466,11 @@ ensure_agent_sync() {
   "${c[@]}" options relays-enabled set false
   "${c[@]}" options natenabled set false
   "${c[@]}" options uraccepted set -- -1
-  if ! "${c[@]}" folders list | grep -qx claude; then
-    "${c[@]}" folders add --id claude --label claude --path "$HOME/.claude" --type sendreceive
+  if ! "${c[@]}" folders list | grep -qx "$ST_FOLDER"; then
+    "${c[@]}" folders add --id "$ST_FOLDER" --label "$ST_FOLDER" --path "$HOME/.claude" --type receiveonly
   fi
-  "${c[@]}" folders claude versioning type set staggered
-  info "folder claude = ~/.claude, old versions kept in ~/.claude/.stversions"
+  "${c[@]}" folders "$ST_FOLDER" versioning type set staggered
+  info "folder $ST_FOLDER = ~/.claude, old versions kept in ~/.claude/.stversions"
 
   local link
   for link in "$HOME/.claude/skills"/*; do
@@ -436,11 +483,14 @@ ensure_agent_sync() {
 
   local id ip
   id="$(syncthing device-id)"
+  finish_join "$id" && return
   ip="$("$(tailscale_cli)" ip -4 2> /dev/null | head -1 || true)"
   [ -n "$ip" ] || ip="<tailnet-ip>"
-  info "to pair, run these on a machine already syncing, then the same here with its id, name and ip:"
-  info "  syncthing cli config devices add --device-id $id --name $HOST --addresses tcp://$ip:22000"
-  info "  syncthing cli config folders claude devices add --device-id $id"
+  info "joining (receive-only until the first sync). Pair once: run these on a machine already"
+  info "syncing, then the same here with its id (syncthing device-id), tailnet name and ip:"
+  info "  syncthing cli config devices add --device-id $id --name ${tailnet_name:-$HOST} --addresses tcp://$ip:22000"
+  info "  syncthing cli config folders $ST_FOLDER devices add --device-id $id"
+  info "then re-run bootstrap: the synced copy replaces this machine's differing files"
 }
 
 main() {
