@@ -193,6 +193,11 @@ check_peer() {
   fi
 
   rc=0
+  if [ "$ip" = "$SELF_IP" ]; then
+    out="$(sh -c "$REMOTE_SCRIPT" sh "$MODE" "$SECONDS_ON" "$LABEL" < /dev/null 2> /dev/null)" || rc=$?
+    echo "${out:-the wake commands failed here (exit $rc)}"
+    return
+  fi
   # Save the script before running it, so no command inside can consume the rest of it from stdin.
   # shellcheck disable=SC2029 # the arguments are validated words, expanded here on purpose
   out="$(ssh "${SSH_OPTS[@]}" "$ip" \
@@ -244,7 +249,7 @@ esac
 
 TS="$(tailscale_cli)" || die "tailscale CLI not found"
 # Columns: ip, name, user, os, then free-form status ("active; direct ...", "offline, last seen 8d ago", "-").
-peers="$("$TS" status --self=false | awk '$1 ~ /^100\./ {
+peers="$("$TS" status | awk '$1 ~ /^100\./ {
   status = $0; sub(/^([^ ]+ +){4}/, "", status); sub(/ +$/, "", status)
   print $2 "\t" $4 "\t" $1 "\t" status
 }')"
@@ -252,12 +257,13 @@ peers="$("$TS" status --self=false | awk '$1 ~ /^100\./ {
 # Name matching ignores case. Bash 3.2 (macOS) has no ${var,,}, and errors on "${empty[@]}" under set -u.
 shopt -s nocasematch
 names="$(cut -f1 <<< "$peers")"
-self_name="$("$TS" status | awk 'NR == 1 { print $2 }')"
+# The first row is this machine; it is woken locally instead of over SSH.
+SELF_IP="$(head -1 <<< "$peers" | cut -f3)"
 
 # A word that is a full peer name picks only that peer, so "federicos-macbook-pro" skips "-2".
 matches() {
   local name=$1 word=$2
-  if [[ $'\n'"$names"$'\n'"$self_name"$'\n' == *$'\n'"$word"$'\n'* ]]; then
+  if [[ $'\n'"$names"$'\n' == *$'\n'"$word"$'\n'* ]]; then
     [[ "$name" == "$word" ]]
   else
     [[ "$name" == *"$word"* ]]
@@ -280,7 +286,6 @@ while IFS=$'\t' read -r name os ip status; do
 done <<< "$peers"
 
 for f in ${FILTERS[@]+"${FILTERS[@]}"}; do
-  [[ "$f" != "$self_name" ]] || die "'$f' is this machine; run wake from another one"
   [[ "$names" == *"$f"* ]] || die "no tailnet peer matches '$f'"
 done
 [ ${#selected[@]} -gt 0 ] || die "no tailnet peers found"
@@ -294,7 +299,7 @@ short_name() {
     count=0
     while IFS= read -r other; do
       [[ "$other" == *"$part"* ]] && count=$((count + 1))
-    done <<< "$names"$'\n'"$self_name"
+    done <<< "$names"
     if [ "$count" = 1 ] && { [ -z "$best" ] || [ ${#part} -lt ${#best} ]; }; then
       best=$part
     fi
