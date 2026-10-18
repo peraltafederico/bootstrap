@@ -13,7 +13,7 @@ into `~/.ssh/authorized_keys` every 15 minutes. No secrets live in this repo.
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/peraltafederico/bootstrap/main/bootstrap.sh)"
 ```
 
-It installs Tailscale and an SSH server, installs and schedules `keysync`,
+It installs Tailscale with automatic updates and an SSH server, installs and schedules `keysync`,
 creates an SSH key if missing, publishes it to GitHub, and sets up agent config
 sync (below). You approve two
 things in a browser: the Tailscale login and a GitHub device code. The GitHub
@@ -57,6 +57,22 @@ woken remotely.
   Mac is set to system-sleep; `sudo pmset -c sleep 0` keeps it awake on power while the
   display still sleeps.
 - Linux: GNOME only (X11 or Wayland).
+
+## Orca updates
+
+`orca-update` installs the latest [Orca](https://github.com/stablyai/orca) release when the
+machine is behind and restarts Orca if it was running. Orca's terminals live in its daemon,
+which is left alone, so sessions survive the restart. Bootstrap runs it once and then daily
+at 04:30 (missed runs happen on wake).
+
+```sh
+orca-update            # update now if needed
+orca-update --check    # installed and latest versions only
+orca-update --force    # reinstall the latest release
+```
+
+macOS replaces `/Applications/Orca.app`. Linux keeps one AppImage at
+`~/Applications/Orca.AppImage`, checked by sha512 against the release, with an app-menu entry.
 
 ## Agent config sync
 
