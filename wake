@@ -162,7 +162,19 @@ linux() {
   # Power the monitors through Mutter only. ScreenSaver.SetActive false would also unlock the session.
   gnome org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/DisplayConfig \
     org.freedesktop.DBus.Properties.Set org.gnome.Mutter.DisplayConfig PowerSaveMode "<0>" > /dev/null
-  echo "display on for $label (was $state)"
+  # A locked screen keeps a black overlay over the powered monitors until input arrives. On X11,
+  # resetting the X idle timer counts as input (Mutter ResetIdletime is test-only); Wayland has no
+  # equivalent, so there the lock screen stays black until a key press.
+  note=""
+  shell_env=$(tr "\0" "\n" < "/proc/$(pgrep -u "$(id -u)" -x gnome-shell | head -1)/environ" 2> /dev/null)
+  session_var() { printf "%s\n" "$shell_env" | sed -n "s/^$1=//p"; }
+  if [ "$(session_var XDG_SESSION_TYPE)" = x11 ]; then
+    DISPLAY=$(session_var DISPLAY) XAUTHORITY=$(session_var XAUTHORITY) xset s reset 2> /dev/null \
+      || note="; could not reset the X idle timer, so a locked screen may stay black"
+  else
+    note="; Wayland session: a locked screen stays black until a key press"
+  fi
+  echo "display on for $label (was $state)$note"
 }
 
 case "$(uname -s)" in
