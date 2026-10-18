@@ -14,7 +14,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/peraltafederico/bootstra
 ```
 
 It installs Tailscale and an SSH server, installs and schedules `keysync`,
-creates an SSH key if missing, and publishes it to GitHub. You approve two
+creates an SSH key if missing, publishes it to GitHub, and sets up agent config
+sync (below). You approve two
 things in a browser: the Tailscale login and a GitHub device code. The GitHub
 login is temporary and removed when the script ends. Re-running is safe.
 
@@ -56,6 +57,34 @@ woken remotely.
   Mac is set to system-sleep; `sudo pmset -c sleep 0` keeps it awake on power while the
   display still sleeps.
 - Linux: GNOME only (X11 or Wayland).
+
+## Agent config sync
+
+Bootstrap also installs Syncthing and shares `~/.claude` with the other machines,
+filtered by [`claude.stignore`](claude.stignore) to `CLAUDE.md`, `skills/`, `agents/`
+and each project's `memory/`. Credentials, `settings.json`, sessions and caches stay
+per machine. Peers dial each other on their tailnet IP; relays and public discovery are
+off. Old versions of changed or deleted files are kept in `~/.claude/.stversions`.
+
+Codex reads the same files through two relative links, so new skills need no extra step:
+
+```
+~/.codex/AGENTS.md -> ../.claude/CLAUDE.md
+~/.codex/skills    -> ../.claude/skills
+```
+
+Pair a new machine once: bootstrap prints two commands to run on a machine that
+already syncs, then run the same two here with that machine's id (`syncthing device-id`),
+name and tailnet IP. The Air MacBook stays out:
+
+```sh
+BOOTSTRAP_AGENT_SYNC=0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/peraltafederico/bootstrap/main/bootstrap.sh)"
+```
+
+Bootstrap never replaces a real `~/.codex/AGENTS.md` or a real skill inside
+`~/.codex/skills`, and warns about absolute symlinks in `~/.claude/skills`, which
+would sync as dead links. The `.stignore` is not synced itself, so ignore-list
+changes reach a machine when bootstrap re-runs there.
 
 ## Removing a machine
 

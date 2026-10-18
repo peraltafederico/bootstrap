@@ -6,6 +6,7 @@
 # Optional environment:
 #   BOOTSTRAP_HOSTNAME     tailnet name to claim (default: the system hostname)
 #   BOOTSTRAP_GITHUB_USER  GitHub account whose keys form the mesh (default: peraltafederico)
+#   BOOTSTRAP_AGENT_SYNC   0 skips the Syncthing step for agent config (the Air MacBook)
 set -euo pipefail
 
 GITHUB_USER="${BOOTSTRAP_GITHUB_USER:-peraltafederico}"
@@ -118,21 +119,26 @@ allow_ssh_in_firewall() {
   fi
 }
 
-# Installs a script from this repo into $BIN_DIR: the local checkout when run from one, else GitHub.
-install_tool() {
-  local name=$1 here="" tmp
-  mkdir -p "$BIN_DIR"
+# Installs a file from this repo: the local checkout when run from one, else GitHub.
+install_repo_file() {
+  local name=$1 dest=$2 mode=$3 here="" tmp
+  mkdir -p "$(dirname "$dest")"
   if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   fi
   if [ -n "$here" ] && [ -f "$here/$name" ]; then
-    install -m 755 "$here/$name" "$BIN_DIR/$name"
+    install -m "$mode" "$here/$name" "$dest"
   else
     tmp="$(mktemp)"
     curl -fsSL "$RAW_URL/$name" -o "$tmp"
-    install -m 755 "$tmp" "$BIN_DIR/$name"
+    install -m "$mode" "$tmp" "$dest"
     rm -f "$tmp"
   fi
+}
+
+install_tool() {
+  local name=$1
+  install_repo_file "$name" "$BIN_DIR/$name" 755
   info "installed $BIN_DIR/$name"
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
@@ -305,6 +311,125 @@ KbdInteractiveAuthentication no'
   info "SSH password login is off, keys only"
 }
 
+install_syncthing() {
+  if command -v syncthing > /dev/null; then
+    info "syncthing already installed"
+  elif [ "$OS" = Darwin ]; then
+    command -v brew > /dev/null || return 1
+    brew install -q syncthing
+  elif command -v apt-get > /dev/null; then
+    # Debian and Ubuntu still ship Syncthing 1.x; the official repo matches the Macs' 2.x.
+    sudo install -d -m 0755 /etc/apt/keyrings
+    sudo curl -fsSL -o /etc/apt/keyrings/syncthing-archive-keyring.gpg https://syncthing.net/release-key.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/syncthing-archive-keyring.gpg] https://apt.syncthing.net/ syncthing stable-v2" \
+      | sudo tee /etc/apt/sources.list.d/syncthing.list > /dev/null
+    install_pkg syncthing
+  else
+    install_pkg syncthing
+  fi
+
+  if [ "$OS" = Darwin ]; then
+    brew services start syncthing > /dev/null
+  else
+    systemctl --user show-environment > /dev/null 2>&1 || return 1
+    systemctl --user enable --now syncthing.service > /dev/null 2>&1
+    sudo loginctl enable-linger "$ME"
+  fi
+}
+
+# Points $2 at relative target $1. Symlinks are replaced; real files and folders are left alone.
+link_relative() {
+  local target=$1 link=$2
+  if [ -L "$link" ]; then
+    [ "$(readlink "$link")" = "$target" ] && return
+    rm "$link"
+  elif [ -e "$link" ]; then
+    warn "$link is a real file or folder, not linking it to $target"
+    return
+  fi
+  ln -s "$target" "$link"
+  info "linked $link -> $target"
+}
+
+# Codex reads Claude's instructions and skills through relative links, so they work under any home.
+link_codex() {
+  local skills="$HOME/.codex/skills" entry
+  mkdir -p "$HOME/.codex"
+  link_relative ../.claude/CLAUDE.md "$HOME/.codex/AGENTS.md"
+
+  if [ -d "$skills" ] && [ ! -L "$skills" ]; then
+    # Only links from the old sync-codex layout and Codex's built-ins (.system) can be moved aside.
+    for entry in "$skills"/* "$skills"/.[!.]*; do
+      if [ -e "$entry" ] && [ ! -L "$entry" ] && [ "$(basename "$entry")" != .system ]; then
+        warn "$skills has a real skill, $(basename "$entry"): move it into ~/.claude/skills, then re-run"
+        return
+      fi
+    done
+    find "$skills" -mindepth 1 -maxdepth 1 -type l -delete
+    if [ -d "$skills/.system" ]; then
+      rm -rf "$HOME/.claude/skills/.system"
+      mv "$skills/.system" "$HOME/.claude/skills/.system"
+    fi
+    rmdir "$skills"
+  fi
+  link_relative ../.claude/skills "$skills"
+}
+
+# Shares ~/.claude's portable config (CLAUDE.md, skills, agents, memories) with the other machines.
+ensure_agent_sync() {
+  step "Agent config sync (Syncthing)"
+  if [ "${BOOTSTRAP_AGENT_SYNC:-1}" = 0 ]; then
+    info "skipped (BOOTSTRAP_AGENT_SYNC=0)"
+    return
+  fi
+  if ! install_syncthing; then
+    warn "could not install or start Syncthing (macOS needs Homebrew, Linux a systemd user session)"
+    return
+  fi
+
+  # The ignore list must be in place before the folder exists, or everything in ~/.claude would sync.
+  mkdir -p "$HOME/.claude/skills"
+  install_repo_file claude.stignore "$HOME/.claude/.stignore" 644
+
+  local tries=0
+  until syncthing cli show system > /dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 30 ]; then
+      warn "Syncthing did not answer after 30 seconds, re-run to finish its setup"
+      return
+    fi
+    sleep 1
+  done
+  local c=(syncthing cli config)
+  # Peers are dialed on their tailnet address, so nothing goes through public discovery or relays.
+  "${c[@]}" options global-ann-enabled set false
+  "${c[@]}" options relays-enabled set false
+  "${c[@]}" options natenabled set false
+  "${c[@]}" options uraccepted set -- -1
+  if ! "${c[@]}" folders list | grep -qx claude; then
+    "${c[@]}" folders add --id claude --label claude --path "$HOME/.claude" --type sendreceive
+  fi
+  "${c[@]}" folders claude versioning type set staggered
+  info "folder claude = ~/.claude, old versions kept in ~/.claude/.stversions"
+
+  local link
+  for link in "$HOME/.claude/skills"/*; do
+    if [ -L "$link" ] && [[ "$(readlink "$link")" == /* ]]; then
+      warn "$link is an absolute symlink: replace it with the real folder before pairing, or the dead link syncs everywhere"
+    fi
+  done
+
+  link_codex
+
+  local id ip
+  id="$(syncthing device-id)"
+  ip="$("$(tailscale_cli)" ip -4 2> /dev/null | head -1 || true)"
+  [ -n "$ip" ] || ip="<tailnet-ip>"
+  info "to pair, run these on a machine already syncing, then the same here with its id, name and ip:"
+  info "  syncthing cli config devices add --device-id $id --name $HOST --addresses tcp://$ip:22000"
+  info "  syncthing cli config folders claude devices add --device-id $id"
+}
+
 main() {
   [ "$(id -u)" -ne 0 ] || die "run as your normal user, not root (keys belong to your account)"
   case "$OS" in
@@ -327,6 +452,7 @@ main() {
   ensure_key
   publish_key
   require_ssh_keys
+  ensure_agent_sync
 
   step "Done"
   info "Other machines accept this one within 15 minutes. To do it now, run this"
