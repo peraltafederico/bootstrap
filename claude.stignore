@@ -1,0 +1,19 @@
+// Syncthing ignore list for ~/.claude, installed by bootstrap.sh: share only portable config.
+// Credentials, settings.json (machine paths), sessions and caches stay per machine.
+// First match wins: excludes first, then the allowlist, then ignore the rest.
+(?d).DS_Store
+(?d)node_modules
+(?d)__pycache__
+(?d)*.pyc
+// claude.ai's own skill sync, Orca-managed links, and Codex built-ins
+/skills/synced
+/skills/orca-cli
+/skills/orca-linear
+/skills/orchestration
+/skills/computer-use
+/skills/.system
+!/CLAUDE.md
+!/skills
+!/agents
+!/projects/*/memory
+*
