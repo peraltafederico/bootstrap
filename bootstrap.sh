@@ -425,6 +425,32 @@ finish_join() {
   info "joined: this machine now sends changes too (its old versions are in ~/.claude/.stversions)"
 }
 
+# settings.json stays per machine (Orca and airloop write machine-specific hooks into it), so the
+# portable preferences in claude-settings.json are merged in instead; shared keys win, others stay.
+apply_claude_settings() {
+  local settings="$HOME/.claude/settings.json" shared tmp
+  if ! command -v jq > /dev/null; then
+    if [ "$OS" = Darwin ]; then brew install -q jq; else install_pkg jq; fi
+  fi
+  shared="$(mktemp)"
+  install_repo_file claude-settings.json "$shared" 644
+  [ -s "$settings" ] || echo '{}' > "$settings"
+  if jq -e --slurpfile s "$shared" '. * $s[0] == .' "$settings" > /dev/null 2>&1; then
+    info "shared Claude settings already in ~/.claude/settings.json"
+  else
+    tmp="$(mktemp)"
+    if jq -s '.[0] * .[1]' "$settings" "$shared" > "$tmp" 2> /dev/null; then
+      # cat keeps the file's inode and permissions for apps that watch it.
+      cat "$tmp" > "$settings"
+      info "merged shared Claude settings into ~/.claude/settings.json"
+    else
+      warn "$settings is not valid JSON, shared Claude settings not applied"
+    fi
+    rm -f "$tmp"
+  fi
+  rm -f "$shared"
+}
+
 # Shares ~/.claude's portable config (CLAUDE.md, skills, agents, memories) with the other machines.
 ensure_agent_sync() {
   step "Agent config sync (Syncthing)"
@@ -480,6 +506,7 @@ ensure_agent_sync() {
   done
 
   link_codex
+  apply_claude_settings
 
   local id ip
   id="$(syncthing device-id)"

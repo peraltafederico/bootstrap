@@ -66,6 +66,11 @@ and each project's `memory/`. Credentials, `settings.json`, sessions and caches 
 per machine. Peers dial each other on their tailnet IP; relays and public discovery are
 off. Old versions of changed or deleted files are kept in `~/.claude/.stversions`.
 
+`settings.json` is not synced: apps like Orca write machine-specific hooks into it. Bootstrap
+merges the portable preferences in [`claude-settings.json`](claude-settings.json) into it
+instead (commit attribution off, bypass permissions, effort, retention); those keys win and
+the rest of the file is kept. Edit that file and re-run bootstrap to change them everywhere.
+
 Codex reads the same files through two relative links, so new skills need no extra step:
 
 ```
