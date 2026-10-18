@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# orca-update: install the latest Orca release when this machine is behind, then restart Orca
+# if it was running. Orca's terminals live in its daemon, so a restart keeps sessions.
+#
+#   orca-update            update if needed
+#   orca-update --check    report the installed and latest versions only
+#   orca-update --force    reinstall the latest release even if it is already installed
+#
+# macOS replaces /Applications/Orca.app; Linux keeps one AppImage at ~/Applications/Orca.AppImage
+# with an app-menu entry for it.
+set -euo pipefail
+
+RELEASES=https://github.com/stablyai/orca/releases/latest/download
+MAC_APP=/Applications/Orca.app
+APPIMAGE="$HOME/Applications/Orca.AppImage"
+MODE=update
+# Temp paths removed on exit; one list, since a trap per function would replace the others.
+CLEANUP=()
+trap 'rm -rf ${CLEANUP[@]+"${CLEANUP[@]}"}' EXIT
+
+log() { printf 'orca-update: %s\n' "$*"; }
+die() {
+  log "$*" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  "") ;;
+  --check) MODE=check ;;
+  --force) MODE=force ;;
+  -h | --help)
+    sed -n '2,10s/^# \{0,1\}//p' "$0"
+    exit 0
+    ;;
+  *) die "unknown option: $1" ;;
+esac
+
+# Prints "<version> <sha512> <asset>" for the first asset in a latest-*.yml manifest matching $2.
+release_entry() {
+  curl -fsSL --retry 3 "$RELEASES/$1" | awk -v pat="$2" '
+    /^version:/ { version = $2 }
+    /^ *- url:/ { url = $3 }
+    /^ *sha512:/ && url ~ pat && !done { print version, $2, url; done = 1 }'
+}
+
+sha512_b64() { openssl dgst -sha512 -binary "$1" | openssl base64 -A; }
+
+# True when version $1 is older than $2 (dotted numbers).
+older() {
+  local IFS=. i a b
+  read -ra a <<< "$1"
+  read -ra b <<< "$2"
+  for i in 0 1 2 3; do
+    [ "${a[i]:-0}" -lt "${b[i]:-0}" ] && return 0
+    [ "${a[i]:-0}" -gt "${b[i]:-0}" ] && return 1
+  done
+  return 1
+}
+
+# Downloads asset $1 to file $2 and checks it against sha512 $3.
+fetch() {
+  curl -fsSL --retry 3 -o "$2" "$RELEASES/$1"
+  [ "$(sha512_b64 "$2")" = "$3" ] || die "checksum mismatch for $1, not installing it"
+}
+
+# True once every pid in $@ has exited, polling for up to $1 seconds.
+wait_gone() {
+  local secs=$1 _ pid alive
+  shift
+  for _ in $(seq "$secs"); do
+    alive=false
+    for pid in "$@"; do kill -0 "$pid" 2> /dev/null && alive=true; done
+    $alive || return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Quits Orca's main process. On macOS a quit waits on an in-app close confirmation that nobody
+# answers unattended, so after 15 seconds the main process is killed. The daemon is a separate
+# process and keeps the terminals either way.
+stop_orca() {
+  kill -TERM "$@" 2> /dev/null || true
+  wait_gone 15 "$@" && return 0
+  kill -KILL "$@" 2> /dev/null || true
+  wait_gone 10 "$@"
+}
+
+# Prints the pid of Orca's main process for this user. Its helpers carry --type=, and its daemon
+# and services run the same binary with a .js entry; the daemon holds the terminals, so it is
+# never stopped here.
+orca_pids() { ps -u "$(id -u)" -o pid=,args= | awk -v main="$1" '$2 ~ main && !/--type=/ && !/[.]js( |$)/ { print $1 }'; }
+
+update_mac() {
+  local pattern='-arm64-mac[.]zip$' latest sha asset installed stage pids
+  [ "$(uname -m)" = arm64 ] || pattern='^Orca-[0-9.]+-mac[.]zip$'
+  read -r latest sha asset <<< "$(release_entry latest-mac.yml "$pattern")"
+  [ -n "${asset:-}" ] || die "no macOS build in the latest release"
+  installed="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$MAC_APP/Contents/Info.plist" 2> /dev/null || echo none)"
+  if [ "$MODE" = check ]; then
+    log "installed $installed, latest $latest"
+    return
+  fi
+  if [ "$MODE" = update ] && [ "$installed" != none ] && ! older "$installed" "$latest"; then
+    log "up to date ($installed)"
+    return
+  fi
+
+  # Staging next to the app keeps the final swap a rename on the same volume.
+  stage="$(mktemp -d /Applications/.orca-update.XXXXXX)"
+  CLEANUP+=("$stage")
+  fetch "$asset" "$stage/orca.zip" "$sha"
+  ditto -x -k "$stage/orca.zip" "$stage/new"
+  [ -d "$stage/new/Orca.app" ] || die "the downloaded archive has no Orca.app"
+
+  pids="$(orca_pids "^$MAC_APP/Contents/MacOS/Orca$")"
+  # shellcheck disable=SC2086 # one pid per word
+  if [ -n "$pids" ] && ! stop_orca $pids; then
+    die "Orca did not exit, leaving $installed in place"
+  fi
+  [ ! -d "$MAC_APP" ] || mv "$MAC_APP" "$stage/old.app"
+  if ! mv "$stage/new/Orca.app" "$MAC_APP"; then
+    mv "$stage/old.app" "$MAC_APP"
+    die "could not move the new Orca.app into /Applications, kept $installed"
+  fi
+  [ -z "$pids" ] || open -a "$MAC_APP"
+  log "updated $installed -> $latest${pids:+, restarted Orca}"
+}
+
+# The AppImage ships its own menu entry and icon; point them at the fixed AppImage path.
+# Best effort: a missing entry never blocks an update.
+install_menu_entry() {
+  local work apps="$HOME/.local/share/applications" icons="$HOME/.local/share/icons"
+  local root icon=""
+  work="$(mktemp -d)"
+  CLEANUP+=("$work")
+  root="$work/squashfs-root"
+  # Patterns match one path segment per '*'; the top-level orca-ide.png is only a symlink.
+  (cd "$work" && "$APPIMAGE" --appimage-extract orca-ide.desktop \
+    && "$APPIMAGE" --appimage-extract 'usr/share/icons/hicolor/*/apps/orca-ide.png') > /dev/null 2>&1
+  [ -f "$root/usr/share/icons/hicolor/512x512/apps/orca-ide.png" ] \
+    && icon="$root/usr/share/icons/hicolor/512x512/apps/orca-ide.png"
+  [ -n "$icon" ] || icon="$(find "$root/usr/share/icons" -name orca-ide.png 2> /dev/null | sort | tail -1)"
+  if [ ! -f "$root/orca-ide.desktop" ]; then
+    log "the AppImage has no orca-ide.desktop, skipped the app-menu entry"
+    return
+  fi
+  mkdir -p "$apps" "$icons"
+  [ -z "$icon" ] || cp "$icon" "$icons/orca-ide.png"
+  sed -e "s|^Exec=.*|Exec=\"$APPIMAGE\" %U|" -e "s|^Icon=.*|Icon=$icons/orca-ide.png|" \
+    "$root/orca-ide.desktop" > "$apps/orca-ide.desktop"
+  update-desktop-database "$apps" > /dev/null 2>&1 || true
+}
+
+update_linux() {
+  local manifest=latest-linux.yml pattern='^orca-linux[.]AppImage$' latest sha asset current tmp pids
+  if [ "$(uname -m)" = aarch64 ]; then
+    manifest="latest-linux-arm64.yml"
+    pattern='^orca-linux-arm64[.]AppImage$'
+  fi
+  read -r latest sha asset <<< "$(release_entry "$manifest" "$pattern")"
+  [ -n "${asset:-}" ] || die "no Linux AppImage in the latest release"
+  current=none
+  [ -f "$APPIMAGE" ] && current="$(sha512_b64 "$APPIMAGE")"
+  if [ "$MODE" = check ]; then
+    if [ "$current" = "$sha" ]; then log "installed $latest (latest)"; else log "latest is $latest; $APPIMAGE is older or missing"; fi
+    return
+  fi
+  if [ "$MODE" = update ] && [ "$current" = "$sha" ]; then
+    log "up to date ($latest)"
+    return
+  fi
+
+  mkdir -p "$(dirname "$APPIMAGE")"
+  tmp="$(mktemp "$APPIMAGE.XXXXXX")"
+  CLEANUP+=("$tmp")
+  fetch "$asset" "$tmp" "$sha"
+  chmod 755 "$tmp"
+  # A running Orca keeps its mounted copy of the old file, so swapping it under Orca is safe.
+  mv -f "$tmp" "$APPIMAGE"
+  install_menu_entry || log "could not create the app-menu entry"
+
+  pids="$(orca_pids '/orca-ide$')"
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086 # one pid per word
+    stop_orca $pids || die "installed $latest, but Orca did not exit; restart it yourself"
+    # Its own unit, so the new Orca outlives this job; the user manager has the session's DISPLAY.
+    systemd-run --user --collect --quiet "$APPIMAGE"
+  fi
+  log "installed $latest at $APPIMAGE${pids:+, restarted Orca}"
+}
+
+case "$(uname -s)" in
+  Darwin) update_mac ;;
+  Linux) update_linux ;;
+  *) die "unsupported OS: $(uname -s)" ;;
+esac

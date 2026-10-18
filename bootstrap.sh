@@ -73,11 +73,28 @@ ensure_tailscale() {
 
   if "$ts" status > /dev/null 2>&1; then
     info "already connected"
+  else
+    [ "$OS" = Linux ] || die "open the Tailscale app and log in, then re-run"
+    info "approve this machine in the browser link printed below"
+    tty_in sudo "$ts" up ${BOOTSTRAP_HOSTNAME:+--hostname "$BOOTSTRAP_HOSTNAME"}
+  fi
+  tailscale_auto_update "$ts"
+}
+
+# Tailscale updates itself once auto-update is on; only call sudo when it is still off.
+tailscale_auto_update() {
+  local ts=$1 set_cmd
+  if "$ts" debug prefs 2> /dev/null | tr -d ' \t\n' | grep -q '"AutoUpdate":{"Check":true,"Apply":true}'; then
+    info "automatic updates on"
     return
   fi
-  [ "$OS" = Linux ] || die "open the Tailscale app and log in, then re-run"
-  info "approve this machine in the browser link printed below"
-  tty_in sudo "$ts" up ${BOOTSTRAP_HOSTNAME:+--hostname "$BOOTSTRAP_HOSTNAME"}
+  set_cmd=("$ts" set --auto-update)
+  if [ "$OS" = Linux ]; then set_cmd=(sudo "${set_cmd[@]}"); fi
+  if "${set_cmd[@]}" 2> /dev/null; then
+    info "turned on automatic updates"
+  else
+    warn "could not turn on Tailscale automatic updates (App Store installs update through the App Store)"
+  fi
 }
 
 ensure_ssh_server() {
@@ -220,6 +237,64 @@ EOF
   # Without lingering, user timers stop when the last session closes.
   sudo loginctl enable-linger "$ME"
   info "scheduled every 15 minutes (systemd user timer, logs: journalctl --user -u keysync)"
+}
+
+# Installs orca-update and runs it daily at 04:30; a run missed while asleep happens on wake.
+install_orca_update() {
+  step "Orca updates"
+  install_tool orca-update
+  if [ "$OS" = Darwin ]; then
+    local label="com.$GITHUB_USER.orca-update"
+    local plist="$HOME/Library/LaunchAgents/$label.plist"
+    mkdir -p "$(dirname "$plist")" "$HOME/Library/Logs"
+    cat > "$plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array><string>$BIN_DIR/orca-update</string></array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>30</integer></dict>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/orca-update.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/orca-update.log</string>
+</dict>
+</plist>
+EOF
+    launchctl bootout "gui/$(id -u)" "$plist" 2> /dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+    info "scheduled daily at 04:30 (launchd, log: ~/Library/Logs/orca-update.log)"
+  elif systemctl --user show-environment > /dev/null 2>&1; then
+    local unit_dir="$HOME/.config/systemd/user"
+    mkdir -p "$unit_dir"
+    cat > "$unit_dir/orca-update.service" << EOF
+[Unit]
+Description=Install the latest Orca release and restart Orca
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_DIR/orca-update
+EOF
+    cat > "$unit_dir/orca-update.timer" << 'EOF'
+[Unit]
+Description=Update Orca daily
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now orca-update.timer > /dev/null
+    info "scheduled daily at 04:30 (systemd user timer, logs: journalctl --user -u orca-update)"
+  else
+    warn "no systemd user session: schedule $BIN_DIR/orca-update yourself (daily)"
+  fi
+  "$BIN_DIR/orca-update" || warn "Orca update failed, the daily run will retry"
 }
 
 ensure_key() {
@@ -539,6 +614,7 @@ main() {
   install_keysync
   step "wake"
   install_tool wake
+  install_orca_update
   ensure_key
   publish_key
   require_ssh_keys
