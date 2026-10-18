@@ -249,6 +249,19 @@ peers="$("$TS" status --self=false | awk '$1 ~ /^100\./ {
 
 # Name matching ignores case. Bash 3.2 (macOS) has no ${var,,}, and errors on "${empty[@]}" under set -u.
 shopt -s nocasematch
+names="$(cut -f1 <<< "$peers")"
+self_name="$("$TS" status | awk 'NR == 1 { print $2 }')"
+
+# A word that is a full peer name picks only that peer, so "federicos-macbook-pro" skips "-2".
+matches() {
+  local name=$1 word=$2
+  if [[ $'\n'"$names"$'\n'"$self_name"$'\n' == *$'\n'"$word"$'\n'* ]]; then
+    [[ "$name" == "$word" ]]
+  else
+    [[ "$name" == *"$word"* ]]
+  fi
+}
+
 selected=()
 while IFS=$'\t' read -r name os ip status; do
   [ -n "$name" ] || continue
@@ -257,15 +270,15 @@ while IFS=$'\t' read -r name os ip status; do
     continue
   fi
   for f in "${FILTERS[@]}"; do
-    if [[ "$name" == *"$f"* ]]; then
+    if matches "$name" "$f"; then
       selected+=("$name"$'\t'"$os"$'\t'"$ip"$'\t'"$status")
       break
     fi
   done
 done <<< "$peers"
 
-names="$(cut -f1 <<< "$peers")"
 for f in ${FILTERS[@]+"${FILTERS[@]}"}; do
+  [[ "$f" != "$self_name" ]] || die "'$f' is this machine; run wake from another one"
   [[ "$names" == *"$f"* ]] || die "no tailnet peer matches '$f'"
 done
 [ ${#selected[@]} -gt 0 ] || die "no tailnet peers found"
