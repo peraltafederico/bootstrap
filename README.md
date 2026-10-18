@@ -38,7 +38,11 @@ wake                 # turn on the monitors of every computer on the tailnet
 wake mini desktop    # only peers whose name contains one of these words
 wake --for 30m       # keep them on this long (default 10m)
 wake --ping          # report what answers and which displays are on, without waking
+wake -l              # list devices with the short name that picks each one
 ```
+
+Any part of a Tailscale machine name works (`wake air`). `wake -l` shows the shortest part
+unique to each device; rename a machine in the Tailscale admin console for a custom name.
 
 It runs over SSH, so it reaches every machine the mesh trusts. Locked screens stay
 locked: you get the lock screen, not the desktop. Phones answer `--ping` but cannot be

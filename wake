@@ -5,6 +5,7 @@
 #   wake mini lenovo       wake only peers whose name contains one of these words
 #   wake --for 30m         keep the displays on this long (default 10m; s, m or h)
 #   wake --ping [word...]  report reachability and display state without waking
+#   wake -l                list devices with the short name that picks each one
 #
 # Phones answer --ping but cannot be woken remotely.
 set -euo pipefail
@@ -12,7 +13,7 @@ set -euo pipefail
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
 
 usage() {
-  sed -n '2,9s/^# \{0,1\}//p' "$0"
+  sed -n '2,10s/^# \{0,1\}//p' "$0"
 }
 
 die() {
@@ -214,6 +215,7 @@ FILTERS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --ping) MODE=ping ;;
+    -l | --list) MODE=list ;;
     --for)
       [ $# -ge 2 ] || die "--for needs a duration, such as 30m"
       LABEL=$2
@@ -282,6 +284,32 @@ for f in ${FILTERS[@]+"${FILTERS[@]}"}; do
   [[ "$names" == *"$f"* ]] || die "no tailnet peer matches '$f'"
 done
 [ ${#selected[@]} -gt 0 ] || die "no tailnet peers found"
+
+# The shortest dash-separated part of a name that no other device's name contains, so
+# "federicos-mac-mini" lists as "mini". Falls back to the full name.
+short_name() {
+  local name=$1 part best="" count other
+  local IFS=-
+  for part in $name; do
+    count=0
+    while IFS= read -r other; do
+      [[ "$other" == *"$part"* ]] && count=$((count + 1))
+    done <<< "$names"$'\n'"$self_name"
+    if [ "$count" = 1 ] && { [ -z "$best" ] || [ ${#part} -lt ${#best} ]; }; then
+      best=$part
+    fi
+  done
+  echo "${best:-$name}"
+}
+
+if [ "$MODE" = list ]; then
+  for entry in "${selected[@]}"; do
+    IFS=$'\t' read -r name os ip status <<< "$entry"
+    case "$status" in offline*) state="offline (${status#offline, })" ;; *) state=online ;; esac
+    printf '%-12s %-26s %-8s %s\n' "$(short_name "$name")" "$name" "$os" "$state"
+  done
+  exit 0
+fi
 
 # Check every peer at once so one asleep machine's SSH timeout does not delay the rest.
 tmp="$(mktemp -d)"
