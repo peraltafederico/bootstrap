@@ -75,11 +75,10 @@ Codex reads the same files through two relative links, so new skills need no ext
 
 Pair a new machine once: bootstrap prints two commands to run on a machine that
 already syncs, then run the same two here with that machine's id (`syncthing device-id`),
-name and tailnet IP. The Air MacBook stays out:
-
-```sh
-BOOTSTRAP_AGENT_SYNC=0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/peraltafederico/bootstrap/main/bootstrap.sh)"
-```
+name and tailnet IP. The Air MacBook stays out: the step skips tailnet names listed
+in `AGENT_SYNC_SKIP_HOSTS` at the top of `bootstrap.sh`, and it is never paired.
+`BOOTSTRAP_AGENT_SYNC=0` skips the step on any machine and `BOOTSTRAP_AGENT_SYNC=1`
+forces it on a listed one.
 
 Bootstrap never replaces a real `~/.codex/AGENTS.md` or a real skill inside
 `~/.codex/skills`, and warns about absolute symlinks in `~/.claude/skills`, which

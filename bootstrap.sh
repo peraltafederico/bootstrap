@@ -6,7 +6,8 @@
 # Optional environment:
 #   BOOTSTRAP_HOSTNAME     tailnet name to claim (default: the system hostname)
 #   BOOTSTRAP_GITHUB_USER  GitHub account whose keys form the mesh (default: peraltafederico)
-#   BOOTSTRAP_AGENT_SYNC   0 skips the Syncthing step for agent config (the Air MacBook)
+#   BOOTSTRAP_AGENT_SYNC   0 skips the Syncthing step for agent config, 1 forces it
+#                          (default: skip only on AGENT_SYNC_SKIP_HOSTS)
 set -euo pipefail
 
 GITHUB_USER="${BOOTSTRAP_GITHUB_USER:-peraltafederico}"
@@ -20,6 +21,8 @@ ME="$(id -un)"
 HOST="$(uname -n)"
 HOST="${HOST%%.*}"
 WARNINGS=()
+# Tailnet names that never get agent config sync: the Air MacBook is a work machine.
+AGENT_SYNC_SKIP_HOSTS="airs-macbook-pro"
 
 step() { printf '\n==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -378,10 +381,20 @@ link_codex() {
 # Shares ~/.claude's portable config (CLAUDE.md, skills, agents, memories) with the other machines.
 ensure_agent_sync() {
   step "Agent config sync (Syncthing)"
-  if [ "${BOOTSTRAP_AGENT_SYNC:-1}" = 0 ]; then
-    info "skipped (BOOTSTRAP_AGENT_SYNC=0)"
-    return
-  fi
+  local tailnet_name
+  tailnet_name="$("$(tailscale_cli)" status --peers=false 2> /dev/null | awk 'NR==1 { print $2 }' || true)"
+  case "${BOOTSTRAP_AGENT_SYNC:-auto}" in
+    0)
+      info "skipped (BOOTSTRAP_AGENT_SYNC=0)"
+      return
+      ;;
+    auto)
+      if [[ " $AGENT_SYNC_SKIP_HOSTS " == *" ${tailnet_name:-none} "* ]]; then
+        info "skipped on $tailnet_name (set BOOTSTRAP_AGENT_SYNC=1 to force)"
+        return
+      fi
+      ;;
+  esac
   if ! install_syncthing; then
     warn "could not install or start Syncthing (macOS needs Homebrew, Linux a systemd user session)"
     return
