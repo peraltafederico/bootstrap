@@ -539,6 +539,8 @@ main() {
   install_keysync
   step "wake"
   install_tool wake
+  step "tokens"
+  install_tool tokens
   ensure_key
   publish_key
   require_ssh_keys

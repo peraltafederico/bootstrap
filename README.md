@@ -58,6 +58,22 @@ woken remotely.
   display still sleeps.
 - Linux: GNOME only (X11 or Wayland).
 
+## Claude Code token usage
+
+```sh
+tokens                               # this machine, last 7 days, one row per day
+tokens federicos-windows             # any machine you can SSH into: macOS, Linux or Windows
+tokens federicos-desktop federicos-mac-mini --since today --by session
+tokens federicos-windows --watch 60  # refresh every minute
+tokens --json                        # machine-readable
+```
+
+`--since` takes `today`, `12h`, `7d` or a date; `--by` takes `day`, `model`, `session`
+or `project`. It reads the reply logs Claude Code keeps in `~/.claude/projects` (over
+SSH for other machines, nothing is installed there) and counts each API reply once:
+input, output, cache write and cache read tokens. Needs `python3` on the machine
+running it.
+
 ## Agent config sync
 
 Bootstrap also installs Syncthing and shares `~/.claude` with the other machines,
