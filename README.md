@@ -116,7 +116,7 @@ Python 3.9 they re-run themselves with a newer one from Homebrew or `uv python i
 
 A machine that cannot reach the others (the restricted Windows laptop) is installed with
 `claude-statusline --install --devices-pushed`; the desktop copies every machine's usage to it
-every 10 minutes with `claude-statusline --push federicos-windows` from cron.
+every 10 minutes with `claude-statusline --push cami` from cron.
 
 Lines 1 and 2 come from what Claude Code sends the script, so they are always current. Reading
 every machine takes several seconds, so line 3 shows a cache in `~/.cache/claude-statusline` that a
