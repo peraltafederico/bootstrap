@@ -66,13 +66,25 @@ tokens federicos-windows             # any machine you can SSH into: macOS, Linu
 tokens federicos-desktop federicos-mac-mini --since today --by session
 tokens federicos-windows --watch 60  # refresh every minute
 tokens --json                        # machine-readable
+tokens --no-limits                   # skip the plan limits (faster, reads only the named machines)
 ```
 
 `--since` takes `today`, `12h`, `7d` or a date; `--by` takes `day`, `model`, `session`
 or `project`. It reads the reply logs Claude Code keeps in `~/.claude/projects` (over
 SSH for other machines, nothing is installed there) and counts each API reply once:
-input, output, cache write and cache read tokens. Needs `python3` on the machine
-running it.
+input, output, cache write and cache read tokens.
+
+- **API $** is what those tokens would cost at Anthropic's API list prices, kept in
+  `PRICES` at the top of the script. A plan bills a flat fee instead.
+- **Limits**: the 5-hour and 7-day limits belong to the account, which every machine
+  shares. `tokens` asks Anthropic for the account's percentages (the numbers Claude
+  Code's `/usage` shows, fetched on the checked machine with its own login), reads every
+  online tailnet machine, and estimates a machine's part as the account percentage times
+  that machine's share of the API-priced Claude Code usage in the same window. Offline
+  machines are listed as not counted, since their usage would otherwise be credited to
+  the others.
+
+Needs `python3` on the machine running it and on macOS or Linux machines it reads limits from.
 
 ## Agent config sync
 
