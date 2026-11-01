@@ -124,6 +124,8 @@ def load_tokens() -> Tokens | None:
     if spec is None:
         return None
     module = importlib.util.module_from_spec(spec)
+    # Loading a script would otherwise leave a __pycache__ folder next to it in ~/.local/bin.
+    sys.dont_write_bytecode = True
     sys.modules["tokens_cli"] = module
     loader.exec_module(module)
     # tokens has no .py name, so mypy types its attributes as Any; the casts restate their real types.
