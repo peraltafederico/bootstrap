@@ -65,6 +65,7 @@ tokens                               # this machine, last 7 days, one row per da
 tokens federicos-windows             # any machine you can SSH into: macOS, Linux or Windows
 tokens federicos-desktop federicos-mac-mini --since today --by session
 tokens federicos-windows --watch 60  # refresh every minute
+tokens --detail                      # every token type per row
 tokens --json                        # machine-readable
 tokens --no-limits                   # skip the plan limits (faster, reads only the named machines)
 ```
@@ -84,6 +85,7 @@ input, output, cache write and cache read tokens.
   machines are listed as not counted, since their usage would otherwise be credited to
   the others.
 
+Colors turn off when the output is piped or `NO_COLOR` is set; `FORCE_COLOR=1` keeps them.
 Needs `python3` on the machine running it and on macOS or Linux machines it reads limits from.
 
 ## Agent config sync

@@ -452,7 +452,7 @@ def mesh_machines() -> list[Machine]:
 
 def group_key(reply: Reply, by: str) -> str:
     if by == "day":
-        return reply.when.strftime("%Y-%m-%d %a")
+        return f"{reply.when:%a %b} {reply.when.day}"
     if by == "model":
         return reply.model
     if by == "session":
@@ -478,36 +478,85 @@ def dollars(t: Totals) -> str:
     return f"${t.cost:,.2f}" + ("*" if t.unpriced else "")
 
 
-def print_table(title: str, groups: dict[str, Totals], by: str) -> None:
-    print(title)
-    if not groups:
-        print("  no Claude Code usage in this period\n")
-        return
-    header = (by, "replies", "input", "output", "cache write", "cache read", "total", "API $")
+COLOR = (sys.stdout.isatty() or "FORCE_COLOR" in os.environ) and "NO_COLOR" not in os.environ
+ANSI = re.compile(r"\033\[[0-9;]*m")
+BAR_WIDTH = 20
 
-    def row(name: str, t: Totals) -> tuple[str, ...]:
-        return (name, str(t.replies), human(t.input), human(t.output), human(t.cache_write),
-                human(t.cache_read), human(t.total), dollars(t))
 
+def paint(text: str, *codes: str) -> str:
+    return f"\033[{';'.join(codes)}m{text}\033[0m" if COLOR and codes else text
+
+
+def bold(text: str) -> str:
+    return paint(text, "1")
+
+
+def dim(text: str) -> str:
+    return paint(text, "2")
+
+
+def money(text: str) -> str:
+    return paint(text, "32")
+
+
+def width(text: str) -> int:
+    return len(ANSI.sub("", text))
+
+
+def pad(text: str, size: int, right: bool) -> str:
+    gap = " " * (size - width(text))
+    return gap + text if right else text + gap
+
+
+def box(header: list[str] | None, rows: list[list[str]], right: set[int], footer: list[str] | None = None) -> None:
+    """Prints rows in a rounded box; header and footer rows are set off by rules."""
+    every = ([header] if header else []) + rows + ([footer] if footer else [])
+    sizes = [max(width(r[i]) for r in every) for i in range(len(every[0]))]
+
+    def rule(left: str, mid: str, end: str) -> str:
+        return dim(left + mid.join("─" * (n + 2) for n in sizes) + end)
+
+    def cells(row: list[str]) -> str:
+        bar = dim("│")
+        padded = (f" {pad(c, n, i in right)} " for i, (c, n) in enumerate(zip(row, sizes, strict=True)))
+        return bar + bar.join(padded) + bar
+
+    print("  " + rule("╭", "┬", "╮"))
+    if header:
+        print("  " + cells([paint(h, "1", "36") for h in header]))
+        print("  " + rule("├", "┼", "┤"))
+    for row in rows:
+        print("  " + cells(row))
+    if footer:
+        print("  " + rule("├", "┼", "┤"))
+        print("  " + cells([bold(c) for c in footer]))
+    print("  " + rule("╰", "┴", "╯"))
+
+
+def usage_bar(account: float, machine: float) -> str:
+    """Account usage out of 100%, with this machine's part in magenta at the start."""
+    account_cells = round(min(account, 100) / 100 * BAR_WIDTH)
+    machine_cells = min(account_cells, max(1 if machine > 0 else 0, round(machine / 100 * BAR_WIDTH)))
+    level = "32" if account < 50 else "33" if account < 80 else "31"
+    return (paint("█" * machine_cells, "35") + paint("█" * (account_cells - machine_cells), level)
+            + dim("░" * (BAR_WIDTH - account_cells)))
+
+
+def group_rows(groups: dict[str, Totals], detail: bool) -> tuple[list[str], list[list[str]], list[str], set[int]]:
     overall = Totals()
     for t in groups.values():
         overall.merge(t)
-    rows = [row(name, t) for name, t in groups.items()] + [row("TOTAL", overall)]
-    widths = [max(len(r[i]) for r in [header, *rows]) for i in range(len(header))]
-
-    def fmt(r: tuple[str, ...]) -> str:
-        cells = zip(r, widths, strict=True)
-        return "  " + "  ".join(c.ljust(w) if i == 0 else c.rjust(w) for i, (c, w) in enumerate(cells))
-
-    print(fmt(header))
-    for r in rows[:-1]:
-        print(fmt(r))
-    print("  " + "-" * (sum(widths) + 2 * (len(widths) - 1)))
-    print(fmt(rows[-1]))
-    print(f"  last reply: {overall.last:%Y-%m-%d %H:%M}. "
-          "API $ is the list price of these tokens; a plan bills a flat fee.")
-    if overall.unpriced:
-        print(f"  * {overall.unpriced} replies from models without a known price are not in API $.")
+    if detail:
+        def row(name: str, t: Totals) -> list[str]:
+            return [name, str(t.replies), human(t.input), human(t.output), human(t.cache_write),
+                    human(t.cache_read), human(t.total), money(dollars(t))]
+        header = ["Replies", "Input", "Output", "Cache write", "Cache read", "Total", "Cost"]
+    else:
+        def row(name: str, t: Totals) -> list[str]:
+            return [name, str(t.replies), human(t.total), money(dollars(t))]
+        header = ["Replies", "Tokens", "Cost"]
+    rows = [row(name, t) for name, t in groups.items()]
+    return header, rows, row("Total", overall), set(range(1, len(header) + 1))
 
 
 @dataclass(frozen=True)
@@ -533,23 +582,69 @@ def shares(limits: Limits, mine: list[Reply], everyone: list[list[Reply]]) -> li
     return result
 
 
-def print_limits(limits: Limits | None, error: str, machine_shares: list[Share], missing: list[str]) -> None:
+def time_label(moment: datetime) -> str:
+    days_ago = (datetime.now().astimezone().date() - moment.date()).days
+    day = {0: "today", 1: "yesterday"}.get(days_ago, f"{moment:%a %b} {moment.day}")
+    return f"{day} {moment:%H:%M}"
+
+
+def reset_label(moment: datetime) -> str:
+    # The API reports resets a fraction of a second before the boundary; show the boundary.
+    rounded = (moment + timedelta(seconds=30)).replace(second=0, microsecond=0)
+    return f"{rounded:%a %b} {rounded.day}, {rounded:%H:%M}"
+
+
+def limit_rows(
+    limits: Limits | None, error: str, machine_shares: list[Share], missing: list[str]
+) -> list[list[str]]:
     if limits is None:
-        print(f"  limits: unavailable ({error or 'no machine returned them'})\n")
-        return
-    print(f"  limits ({limits.plan}, shared by every machine on the account):")
-    for share in machine_shares:
+        return [[bold("Limits"), paint(f"unavailable ({error or 'no machine returned them'})", "33")]]
+    rows = []
+    by_name = {share.window.name: share for share in machine_shares}
+    for name, label in (("7-day", "Weekly limit"), ("5-hour", "5-hour limit")):
+        share = by_name.get(name)
+        if share is None:
+            rows.append([bold(label), dim("no window open right now")])
+            continue
         w = share.window
-        print(f"    {w.name:<7} account {w.percent:.0f}%, this machine ~{share.percent:.1f}%"
-              f"  (${share.machine_cost:,.2f} of ${share.counted_cost:,.2f} counted), resets {w.resets:%a %b %d %H:%M}")
-    if not any(w.name == "5-hour" for w in limits.windows):
-        print("    5-hour  no active window")
+        rows.append([bold(label), f"{usage_bar(w.percent, share.percent)}  "
+                                  f"{paint(f'{share.percent:.1f}%', '1', '35')} this machine · "
+                                  f"{w.percent:.0f}% whole account"])
+        rows.append([dim("  resets"), dim(reset_label(w.resets))])
     if missing:
-        print(f"    not counted, so this machine's share may be overstated: {', '.join(missing)}")
-    print()
+        note = f"{', '.join(missing)} (this machine's share may be a bit high)"
+        rows.append([bold("Not counted"), paint(note, "33")])
+    return rows
 
 
-def report(hosts: list[str], since: datetime, by: str, as_json: bool, with_limits: bool) -> None:
+def print_summary(groups: dict[str, Totals], by: str, limit_info: list[list[str]], plan: str, detail: bool) -> None:
+    overall = Totals()
+    for t in groups.values():
+        overall.merge(t)
+    rows = list(limit_info)
+    plan_note = f"({plan} is a flat fee)" if plan else "(plans bill a flat fee)"
+    if groups:
+        rows += [
+            [bold("Cost"), f"{money(bold(dollars(overall)))} at API prices {dim(plan_note)}"],
+            [bold("Tokens"), f"{bold(human(overall.total))} {dim('·')} {human(overall.cache_read)} cache reads "
+                             f"{dim('·')} {human(overall.cache_write)} cache writes {dim('·')} "
+                             f"{human(overall.output)} output {dim('·')} {human(overall.input)} input"],
+            [bold("Last used"), time_label(overall.last)],
+        ]
+        if overall.unpriced:
+            unpriced = f"{overall.unpriced} replies from models without a known price"
+            rows.append([bold("Unpriced"), paint(unpriced, "33")])
+    else:
+        rows.append([bold("Usage"), dim("no Claude Code usage in this period")])
+    box(None, rows, set())
+    if groups:
+        header, group_lines, footer, right = group_rows(groups, detail)
+        print()
+        box([by.title(), *header], group_lines, right, footer)
+
+
+def report(hosts: list[str], since: datetime, period: str, by: str, as_json: bool, with_limits: bool,
+           detail: bool) -> None:
     targets = hosts or ["local"]
     machines = mesh_machines() if with_limits else []
     # Read far enough back to cover the 7-day window as well as --since.
@@ -613,13 +708,22 @@ def report(hosts: list[str], since: datetime, by: str, as_json: bool, with_limit
                 "not_counted": missing,
             }
             continue
-        print_table(f"{host}: Claude Code tokens since {since:%Y-%m-%d %H:%M}", groups, by)
-        if with_limits:
-            print_limits(limits, limits_error, machine_shares, missing)
-        else:
-            print()
+        print(f"\n  {paint(host, '1', '36')} {dim('·')} {period}\n")
+        info = limit_rows(limits, limits_error, machine_shares, missing) if with_limits else []
+        print_summary(groups, by, info, limits.plan if limits else "", detail)
+        print()
     if as_json:
         print(json.dumps(output, indent=2))
+
+
+def period_label(value: str) -> str:
+    if value == "today":
+        return "today"
+    match = re.fullmatch(r"(\d+)([hd])", value)
+    if match:
+        amount, unit = int(match.group(1)), "hour" if match.group(2) == "h" else "day"
+        return f"last {amount} {unit}{'s' if amount != 1 else ''}"
+    return f"since {value}"
 
 
 def parse_since(value: str) -> datetime:
@@ -642,17 +746,23 @@ def main() -> None:
         description="Show Claude Code token usage, its API price, and a machine's share of the plan limits.",
     )
     parser.add_argument("hosts", nargs="*", help="SSH hosts to check; 'local' or nothing means this machine")
-    parser.add_argument("--since", type=parse_since, default="7d", help="today, 12h, 7d (default) or YYYY-MM-DD")
+    parser.add_argument("--since", default="7d", help="today, 12h, 7d (default) or YYYY-MM-DD")
     parser.add_argument("--by", choices=GROUPINGS, default="day", help="how to group rows (default: day)")
-    parser.add_argument("--json", action="store_true", help="print JSON instead of tables")
+    parser.add_argument("--json", action="store_true", help="print JSON instead of text")
+    parser.add_argument("--detail", action="store_true",
+                        help="show every token type per row: input, output, cache write, cache read")
     parser.add_argument("--no-limits", action="store_true",
                         help="skip the plan limits, which read every machine on the tailnet")
     parser.add_argument("--watch", type=int, metavar="SECONDS", help="refresh every SECONDS until Ctrl+C")
     args = parser.parse_args()
-    since = args.since if isinstance(args.since, datetime) else parse_since(args.since)
+    try:
+        since = parse_since(args.since)
+    except argparse.ArgumentTypeError as error:
+        parser.error(f"--since: {error}")
 
     def run() -> None:
-        report(args.hosts, since, args.by, args.json, with_limits=not args.no_limits)
+        report(args.hosts, since, period_label(args.since), args.by, args.json,
+               with_limits=not args.no_limits, detail=args.detail)
 
     if args.watch is None:
         run()
