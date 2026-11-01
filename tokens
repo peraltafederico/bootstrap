@@ -354,7 +354,9 @@ def posix_script(cutoff: datetime, with_limits: bool) -> str:
 
 def ssh(host: str, command: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-C", host, command],
+        # accept-new trusts a mesh machine's key the first time it is seen and still rejects a changed key.
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new", "-C",
+         host, command],
         capture_output=True,
         check=False,
     )
@@ -831,7 +833,8 @@ def report(hosts: list[str], since: datetime, period: str, by: str, as_json: boo
     def read(item: tuple[str, str]) -> tuple[str, Source | FetchError]:
         name, host = item
         try:
-            source = read_source(host, file_cutoff, with_limits and name == limits_from)
+            # Every machine asks for the account limits, so a machine whose login cannot be read still gets them.
+            source = read_source(host, file_cutoff, with_limits)
         except FetchError as error:
             return name, error
         source.replies = [r for r in source.replies if r.when >= earliest]
@@ -850,6 +853,8 @@ def report(hosts: list[str], since: datetime, period: str, by: str, as_json: boo
     limits_source = sources.get(limits_from)
     limits = limits_source.limits if limits_source else None
     limits_error = limits_source.limits_error if limits_source else "the machine could not be read"
+    if limits is None:
+        limits = next((s.limits for s in sources.values() if s.limits is not None), None)
     everyone = [s.replies for s in sources.values()]
     period_end: datetime | None = None
     if follow == "cycle":

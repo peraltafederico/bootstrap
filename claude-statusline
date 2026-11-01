@@ -573,7 +573,9 @@ def install(pushed: bool) -> None:
     except (OSError, ValueError):
         raw = {}
     then = [as_str(c) for c in as_list(raw.get("then")) if as_str(c)]
-    is_other = previous and previous != ours and "claude-statusline" not in previous and "claude-hud" not in previous
+    # Ours ends in the script's path (quoted on Windows); Orca's own script is claude-statusline.sh, not this.
+    is_ours = previous == ours or re.search(r"[/\\]claude-statusline\"?$", previous) is not None
+    is_other = bool(previous) and not is_ours and "claude-hud" not in previous
     if is_other and previous not in then:
         then.append(previous)
         print(f"claude-statusline: kept the previous status line as a chained one: {previous[:80]}")
