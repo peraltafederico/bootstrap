@@ -365,8 +365,7 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
         resets = datetime.fromtimestamp(resets_at).astimezone() if resets_at else None
         if percent is None and key == "seven_day" and devices and devices.week is not None:
             percent, resets = devices.week, devices.week_resets
-        if percent is None:
-            parts.append(paint(f"{label} no window open", DIM))
+        if percent is None:  # no window open right now
             continue
         here = mine if key == "seven_day" and devices else 0.0
         when = moment(resets) if resets else ""
@@ -454,8 +453,8 @@ def main() -> None:
     except Exception:  # noqa: BLE001 - a broken tokens install must not blank the status line
         tokens = None
     devices = read_devices(tokens)
-    # A bare reset code renders as a blank line; Claude Code drops lines that are truly empty.
-    spacer = "\033[0m"
+    # Claude Code drops blank lines, so the spacer is a blank braille cell, which is not whitespace.
+    spacer = "\u2800"
     for line in (session_line(data, tokens), spacer, limits_line(data, devices), devices_line(devices),
                  place_line(data)):
         print(line)
