@@ -1,0 +1,910 @@
+#!/usr/bin/env python3
+"""tokens: show how many Claude Code tokens a machine has used, what they cost, and its share of the plan limits.
+
+  tokens                          this machine, last 7 days, by day
+  tokens federicos-windows        a mesh machine over SSH (macOS, Linux or Windows)
+  tokens --since today --by session
+  tokens all                      every machine in one table, with its share of the limits
+  tokens win --watch 60           refresh every 60 seconds
+
+Claude Code logs every reply, with its token usage, to ~/.claude/projects/**/*.jsonl.
+tokens reads those logs (over SSH for other machines) and adds them up. Cost is what the
+tokens would cost at Anthropic API list prices. The 5-hour and 7-day limits belong to the
+account, which every machine shares, so a machine's part of them is estimated from its
+share of the API-priced usage of every reachable machine in the same window.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+GROUPINGS = ("day", "model", "session", "project")
+LIMITS_MARK = "#tokens-limits "
+PHONE_OS = ("android", "iOS")
+
+
+@dataclass(frozen=True)
+class Price:
+    """US dollars per million tokens."""
+
+    input: float
+    output: float
+    cache_read: float
+
+
+# Anthropic API list prices, from the claude-api skill's model table (cached 2026-10-06).
+# Cache writes cost 1.25x the input price for the 5-minute TTL and 2x for the 1-hour TTL.
+PRICES: dict[str, Price] = {
+    "claude-fable-5-1": Price(10.00, 50.00, 0.25),
+    "claude-mythos-5-1": Price(10.00, 50.00, 0.25),
+    "claude-fable-5": Price(10.00, 50.00, 1.00),
+    "claude-mythos-5": Price(10.00, 50.00, 1.00),
+    "claude-opus-5-5": Price(4.00, 20.00, 0.20),
+    "claude-opus-5": Price(5.00, 25.00, 0.50),
+    "claude-opus-4-8": Price(5.00, 25.00, 0.50),
+    "claude-opus-4-7": Price(5.00, 25.00, 0.50),
+    "claude-opus-4-6": Price(5.00, 25.00, 0.50),
+    "claude-sonnet-5-5": Price(2.00, 10.00, 0.20),
+    "claude-sonnet-5": Price(2.00, 10.00, 0.20),
+    "claude-sonnet-4-6": Price(3.00, 15.00, 0.30),
+    "claude-haiku-5-5": Price(0.10, 0.50, 0.01),
+    "claude-haiku-4-5": Price(1.00, 5.00, 0.10),
+}
+# Claude Haiku 5.5 charges more once the prompt passes 100K tokens.
+HAIKU_5_5_LONG = Price(0.50, 2.50, 0.05)
+HAIKU_5_5_LONG_PROMPT = 100_000
+CACHE_WRITE_5M = 1.25
+CACHE_WRITE_1H = 2.0
+FAST_MODE = 2.0
+
+
+@dataclass(frozen=True)
+class Reply:
+    """One API response as logged by Claude Code."""
+
+    key: str
+    when: datetime
+    model: str
+    session: str
+    project: str
+    input: int
+    output: int
+    cache_write: int
+    cache_write_1h: int
+    cache_read: int
+    fast: bool
+    # Forked subagent logs can copy a reply while it is still streaming: same key, partial usage.
+    finished: bool
+
+    def better_than(self, other: Reply) -> bool:
+        return (self.finished, self.output) > (other.finished, other.output)
+
+    def cost(self) -> float | None:
+        """API list price of this reply in US dollars, or None for a model without a known price."""
+        price = PRICES.get(re.sub(r"(-\d{8}|\[\w+\])$", "", self.model))
+        if price is None:
+            return None
+        prompt = self.input + self.cache_write + self.cache_read
+        if self.model.startswith("claude-haiku-5-5") and prompt > HAIKU_5_5_LONG_PROMPT:
+            price = HAIKU_5_5_LONG
+        cache_write_5m = self.cache_write - self.cache_write_1h
+        dollars = (
+            self.input * price.input
+            + self.output * price.output
+            + cache_write_5m * price.input * CACHE_WRITE_5M
+            + self.cache_write_1h * price.input * CACHE_WRITE_1H
+            + self.cache_read * price.cache_read
+        ) / 1_000_000
+        return dollars * FAST_MODE if self.fast else dollars
+
+
+@dataclass
+class Totals:
+    replies: int = 0
+    input: int = 0
+    output: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
+    cost: float = 0.0
+    unpriced: int = 0
+    last: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=UTC))
+
+    def add(self, r: Reply) -> None:
+        self.replies += 1
+        self.input += r.input
+        self.output += r.output
+        self.cache_write += r.cache_write
+        self.cache_read += r.cache_read
+        cost = r.cost()
+        if cost is None:
+            self.unpriced += 1
+        else:
+            self.cost += cost
+        self.last = max(self.last, r.when)
+
+    def merge(self, other: Totals) -> None:
+        self.replies += other.replies
+        self.input += other.input
+        self.output += other.output
+        self.cache_write += other.cache_write
+        self.cache_read += other.cache_read
+        self.cost += other.cost
+        self.unpriced += other.unpriced
+        self.last = max(self.last, other.last)
+
+    @property
+    def total(self) -> int:
+        return self.input + self.output + self.cache_write + self.cache_read
+
+
+@dataclass(frozen=True)
+class Window:
+    """One of the account's rolling usage limits."""
+
+    name: str
+    percent: float
+    starts: datetime
+    resets: datetime
+
+
+@dataclass(frozen=True)
+class Limits:
+    plan: str
+    windows: tuple[Window, ...]
+    # Part of the account's usage that comes from Claude Code rather than chats or other apps.
+    claude_code_fraction: float
+
+
+@dataclass(frozen=True)
+class Machine:
+    """A tailnet device that can run Claude Code."""
+
+    name: str
+    ips: tuple[str, ...]
+    online: bool
+    is_self: bool
+
+    def matches(self, host: str) -> bool:
+        return host == self.name or host in self.ips or (host == "local" and self.is_self)
+
+
+class FetchError(Exception):
+    pass
+
+
+# json.loads returns untyped values; these helpers narrow them so the rest of the file stays typed.
+def as_dict(value: object) -> dict[str, object]:
+    return {k: v for k, v in value.items() if isinstance(k, str)} if isinstance(value, dict) else {}
+
+
+def as_list(value: object) -> list[object]:
+    return list(value) if isinstance(value, list) else []
+
+
+def as_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def as_float(value: object) -> float | None:
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
+def as_str(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def as_time(value: object) -> datetime | None:
+    try:
+        return datetime.fromisoformat(as_str(value).replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+
+def parse_reply(line: str) -> Reply | None:
+    try:
+        record = as_dict(json.loads(line))
+    except json.JSONDecodeError:
+        return None
+    message = as_dict(record.get("message"))
+    usage = as_dict(message.get("usage"))
+    model = as_str(message.get("model"))
+    # API errors and <synthetic> placeholders are logged as replies with zero usage.
+    is_real_reply = record.get("type") == "assistant" and bool(usage) and model != "<synthetic>"
+    when = as_time(record.get("timestamp"))
+    if not is_real_reply or when is None:
+        return None
+    cwd = as_str(record.get("cwd"))
+    return Reply(
+        # Claude Code writes one line per content block, all repeating the same message id and usage.
+        key=f"{as_str(message.get('id'))}:{as_str(record.get('requestId'))}",
+        when=when,
+        model=model or "unknown",
+        session=as_str(record.get("sessionId")),
+        project=re.split(r"[\\/]", cwd.rstrip("\\/"))[-1] if cwd else "unknown",
+        input=as_int(usage.get("input_tokens")),
+        output=as_int(usage.get("output_tokens")),
+        cache_write=as_int(usage.get("cache_creation_input_tokens")),
+        cache_write_1h=as_int(as_dict(usage.get("cache_creation")).get("ephemeral_1h_input_tokens")),
+        cache_read=as_int(usage.get("cache_read_input_tokens")),
+        fast=usage.get("speed") == "fast",
+        finished=message.get("stop_reason") is not None,
+    )
+
+
+# Runs on the machine that holds the Claude login, so its token never leaves it. This is the
+# endpoint Claude Code's /usage screen reads. Prints one line: LIMITS_MARK + JSON.
+LIMITS_SCRIPT = r"""
+import json, os, platform, subprocess, time, urllib.request
+def credentials():
+    if platform.system() == "Darwin":
+        try:
+            found = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                                   capture_output=True, text=True, timeout=5)
+            if found.returncode == 0 and found.stdout.strip():
+                return json.loads(found.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    root = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    with open(os.path.join(root, ".credentials.json")) as f:
+        return json.load(f)
+try:
+    oauth = credentials().get("claudeAiOauth") or {}
+    if not oauth.get("accessToken"):
+        raise RuntimeError("no Claude login on this machine")
+    if oauth.get("expiresAt", 0) <= time.time() * 1000:
+        raise RuntimeError("the Claude login token expired; Claude Code renews it on its next run")
+    request = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+        "Authorization": "Bearer " + oauth["accessToken"], "anthropic-beta": "oauth-2025-04-20"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        out = {"plan": oauth.get("rateLimitTier") or oauth.get("subscriptionType") or "", "usage": json.load(response)}
+except Exception as error:
+    out = {"error": str(error) or type(error).__name__}
+print("#tokens-limits " + json.dumps(out))
+"""
+
+WINDOWS_LIMITS_SCRIPT = r"""
+try {
+  $oauth = (Get-Content -Raw (Join-Path $env:USERPROFILE '.claude\.credentials.json') | ConvertFrom-Json).claudeAiOauth
+  if (-not $oauth.accessToken) { throw 'no Claude login on this machine' }
+  if ($oauth.expiresAt -le [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) {
+    throw 'the Claude login token expired; Claude Code renews it on its next run'
+  }
+  $usage = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/usage' -TimeoutSec 15 -Headers @{
+    Authorization = "Bearer $($oauth.accessToken)"; 'anthropic-beta' = 'oauth-2025-04-20' }
+  $out = @{ plan = "$($oauth.rateLimitTier)"; usage = $usage }
+} catch { $out = @{ error = "$($_.Exception.Message)" } }
+[Console]::Out.WriteLine('#tokens-limits ' + ($out | ConvertTo-Json -Depth 10 -Compress))
+"""
+
+
+def windows_script(cutoff: datetime, with_limits: bool) -> str:
+    return f"""
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$root = Join-Path $env:USERPROFILE '.claude\\projects'
+if (Test-Path $root) {{
+  Get-ChildItem $root -Recurse -Filter *.jsonl -File |
+    Where-Object {{ $_.LastWriteTime -ge [datetime]'{cutoff:%Y-%m-%d}' }} |
+    ForEach-Object {{
+      foreach ($line in [IO.File]::ReadLines($_.FullName)) {{
+        if ($line.Contains('"type":"assistant"')) {{ [Console]::Out.WriteLine($line) }}
+      }}
+    }}
+}}
+{WINDOWS_LIMITS_SCRIPT if with_limits else ""}
+"""
+
+
+def posix_script(cutoff: datetime, with_limits: bool) -> str:
+    logs = (
+        'd="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"; '
+        f"[ -d \"$d\" ] && find \"$d\" -name '*.jsonl' -newermt '{cutoff:%Y-%m-%d}' "
+        "-exec grep -h '\"type\":\"assistant\"' {} +; "
+    )
+    if not with_limits:
+        return logs + "true"
+    encoded = base64.b64encode(LIMITS_SCRIPT.encode()).decode()
+    return logs + f"python3 -c \"import base64; exec(base64.b64decode('{encoded}'))\"; true"
+
+
+def ssh(host: str, command: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-C", host, command],
+        capture_output=True,
+        check=False,
+    )
+
+
+def remote_lines(host: str, cutoff: datetime, with_limits: bool) -> list[str]:
+    # cmd.exe expands %OS% to Windows_NT; POSIX shells print it unchanged.
+    probe = ssh(host, "echo %OS%")
+    if probe.returncode != 0:
+        raise FetchError(f"cannot SSH to {host}: {probe.stderr.decode(errors='replace').strip()}")
+    is_windows = b"Windows_NT" in probe.stdout
+    if is_windows:
+        encoded = base64.b64encode(windows_script(cutoff, with_limits).encode("utf-16-le")).decode()
+        result = ssh(host, f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}")
+    else:
+        result = ssh(host, posix_script(cutoff, with_limits))
+    if result.returncode != 0:
+        raise FetchError(f"reading logs on {host} failed: {result.stderr.decode(errors='replace').strip()[-300:]}")
+    return result.stdout.decode("utf-8", errors="replace").splitlines()
+
+
+def local_lines(cutoff: datetime, with_limits: bool) -> Iterator[str]:
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
+    for path in root.rglob("*.jsonl"):
+        if datetime.fromtimestamp(path.stat().st_mtime).astimezone() < cutoff:
+            continue
+        with path.open(encoding="utf-8", errors="replace") as f:
+            yield from (line for line in f if '"type":"assistant"' in line)
+    if with_limits:
+        result = subprocess.run([sys.executable, "-c", LIMITS_SCRIPT], capture_output=True, text=True, check=False)
+        yield from result.stdout.splitlines()
+
+
+@dataclass
+class Source:
+    """Everything read from one machine."""
+
+    replies: list[Reply]
+    limits: Limits | None = None
+    limits_error: str = ""
+
+
+def parse_limits(payload: str) -> tuple[Limits | None, str]:
+    try:
+        data = as_dict(json.loads(payload))
+    except json.JSONDecodeError:
+        return None, "unreadable limits response"
+    if data.get("error"):
+        return None, as_str(data.get("error"))
+    usage = as_dict(data.get("usage"))
+    breakdown = as_dict(usage.get("seven_day_breakdown"))
+    windows: list[Window] = []
+    for key, name, length in (("five_hour", "5-hour", timedelta(hours=5)), ("seven_day", "7-day", timedelta(days=7))):
+        window = as_dict(usage.get(key))
+        percent = as_float(window.get("utilization"))
+        resets = as_time(window.get("resets_at"))
+        if percent is None or resets is None:
+            continue
+        starts = as_time(breakdown.get("window_started_at")) if key == "seven_day" else None
+        windows.append(Window(name, percent, starts or resets - length, resets))
+    claude_code = next(
+        (as_float(row.get("percent")) for row in map(as_dict, as_list(breakdown.get("rows")))
+         if row.get("key") == "claude_code"),
+        None,
+    )
+    fraction = 1.0 if claude_code is None else claude_code / 100
+    return Limits(plan_label(as_str(data.get("plan"))), tuple(windows), fraction), ""
+
+
+def plan_label(tier: str) -> str:
+    match = re.search(r"(pro|max|team|enterprise)(?:_(\d+x))?", tier.lower())
+    if not match:
+        return tier or "unknown plan"
+    return " ".join(part for part in (match.group(1).title(), match.group(2) or "") if part)
+
+
+def read_source(host: str, cutoff: datetime, with_limits: bool) -> Source:
+    lines = local_lines(cutoff, with_limits) if host == "local" else remote_lines(host, cutoff, with_limits)
+    log_lines: list[str] = []
+    source = Source(replies=[])
+    for line in lines:
+        if line.startswith(LIMITS_MARK):
+            source.limits, source.limits_error = parse_limits(line[len(LIMITS_MARK):])
+        else:
+            log_lines.append(line)
+    source.replies = collect(log_lines, cutoff)
+    return source
+
+
+def collect(lines: Iterable[str], since: datetime) -> list[Reply]:
+    replies: dict[str, Reply] = {}
+    for line in lines:
+        reply = parse_reply(line)
+        if reply is None or reply.when < since:
+            continue
+        seen = replies.get(reply.key)
+        if seen is None or reply.better_than(seen):
+            replies[reply.key] = reply
+    return sorted(replies.values(), key=lambda r: r.when)
+
+
+def tailscale_cli() -> str | None:
+    found = shutil.which("tailscale")
+    mac_app = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    return found or (mac_app if os.path.exists(mac_app) else None)
+
+
+def mesh_machines() -> list[Machine]:
+    """Every non-phone device on the tailnet; empty when Tailscale is not available."""
+    cli = tailscale_cli()
+    if cli is None:
+        return []
+    result = subprocess.run([cli, "status", "--json"], capture_output=True, text=True, check=False)
+    try:
+        status = as_dict(json.loads(result.stdout))
+    except json.JSONDecodeError:
+        return []
+    nodes = [(as_dict(status.get("Self")), True)] + [(as_dict(p), False) for p in as_dict(status.get("Peer")).values()]
+    machines = []
+    for node, is_self in nodes:
+        if as_str(node.get("OS")) in PHONE_OS:
+            continue
+        name = as_str(node.get("DNSName")).split(".")[0] or as_str(node.get("HostName"))
+        ips = tuple(as_str(ip) for ip in as_list(node.get("TailscaleIPs")))
+        machines.append(Machine(name, ips, is_self or node.get("Online") is True, is_self))
+    return machines
+
+
+def group_key(reply: Reply, by: str) -> str:
+    if by == "day":
+        return f"{reply.when:%a %b} {reply.when.day}"
+    if by == "model":
+        return reply.model
+    if by == "session":
+        return f"{reply.session[:8]} {reply.project}"
+    return reply.project
+
+
+def aggregate(replies: Iterable[Reply], by: str) -> dict[str, Totals]:
+    groups: dict[str, Totals] = {}
+    for reply in replies:
+        groups.setdefault(group_key(reply, by), Totals()).add(reply)
+    return groups
+
+
+def human(n: int) -> str:
+    for unit, size in (("B", 1_000_000_000), ("M", 1_000_000), ("k", 1_000)):
+        if n >= size:
+            return f"{n / size:.1f}{unit}"
+    return str(n)
+
+
+def dollars(t: Totals) -> str:
+    return f"${t.cost:,.2f}" + ("*" if t.unpriced else "")
+
+
+COLOR = (sys.stdout.isatty() or "FORCE_COLOR" in os.environ) and "NO_COLOR" not in os.environ
+ANSI = re.compile(r"\033\[[0-9;]*m")
+BAR_WIDTH = 20
+
+
+def paint(text: str, *codes: str) -> str:
+    return f"\033[{';'.join(codes)}m{text}\033[0m" if COLOR and codes else text
+
+
+def bold(text: str) -> str:
+    return paint(text, "1")
+
+
+def dim(text: str) -> str:
+    return paint(text, "2")
+
+
+def money(text: str) -> str:
+    return paint(text, "32")
+
+
+def width(text: str) -> int:
+    return len(ANSI.sub("", text))
+
+
+def pad(text: str, size: int, right: bool) -> str:
+    gap = " " * (size - width(text))
+    return gap + text if right else text + gap
+
+
+def box(header: list[str] | None, rows: list[list[str]], right: set[int], footer: list[str] | None = None) -> None:
+    """Prints rows in a rounded box; header and footer rows are set off by rules."""
+    every = ([header] if header else []) + rows + ([footer] if footer else [])
+    sizes = [max(width(r[i]) for r in every) for i in range(len(every[0]))]
+
+    def rule(left: str, mid: str, end: str) -> str:
+        return dim(left + mid.join("─" * (n + 2) for n in sizes) + end)
+
+    def cells(row: list[str]) -> str:
+        bar = dim("│")
+        padded = (f" {pad(c, n, i in right)} " for i, (c, n) in enumerate(zip(row, sizes, strict=True)))
+        return bar + bar.join(padded) + bar
+
+    print("  " + rule("╭", "┬", "╮"))
+    if header:
+        print("  " + cells([paint(h, "1", "36") for h in header]))
+        print("  " + rule("├", "┼", "┤"))
+    for row in rows:
+        print("  " + cells(row))
+    if footer:
+        print("  " + rule("├", "┼", "┤"))
+        print("  " + cells([bold(c) for c in footer]))
+    print("  " + rule("╰", "┴", "╯"))
+
+
+def usage_bar(account: float, machine: float) -> str:
+    """Account usage out of 100%, with this machine's part in magenta at the start."""
+    account_cells = round(min(account, 100) / 100 * BAR_WIDTH)
+    machine_cells = min(account_cells, max(1 if machine > 0 else 0, round(machine / 100 * BAR_WIDTH)))
+    level = "32" if account < 50 else "33" if account < 80 else "31"
+    return (paint("█" * machine_cells, "35") + paint("█" * (account_cells - machine_cells), level)
+            + dim("░" * (BAR_WIDTH - account_cells)))
+
+
+def group_rows(groups: dict[str, Totals], detail: bool) -> tuple[list[str], list[list[str]], list[str], set[int]]:
+    overall = Totals()
+    for t in groups.values():
+        overall.merge(t)
+    if detail:
+        def row(name: str, t: Totals) -> list[str]:
+            return [name, str(t.replies), human(t.input), human(t.output), human(t.cache_write),
+                    human(t.cache_read), human(t.total), money(dollars(t))]
+        header = ["Replies", "Input", "Output", "Cache write", "Cache read", "Total", "Cost"]
+    else:
+        def row(name: str, t: Totals) -> list[str]:
+            return [name, str(t.replies), human(t.total), money(dollars(t))]
+        header = ["Replies", "Tokens", "Cost"]
+    rows = [row(name, t) for name, t in groups.items()]
+    return header, rows, row("Total", overall), set(range(1, len(header) + 1))
+
+
+@dataclass(frozen=True)
+class Share:
+    window: Window
+    machine_cost: float
+    counted_cost: float
+    percent: float
+
+
+def window_cost(replies: Iterable[Reply], window: Window) -> float:
+    return sum(r.cost() or 0.0 for r in replies if r.when >= window.starts)
+
+
+def shares(limits: Limits, mine: list[Reply], everyone: list[list[Reply]]) -> list[Share]:
+    result = []
+    for window in limits.windows:
+        machine_cost = window_cost(mine, window)
+        counted_cost = sum(window_cost(replies, window) for replies in everyone)
+        fraction = machine_cost / counted_cost if counted_cost else 0.0
+        percent = window.percent * limits.claude_code_fraction * fraction
+        result.append(Share(window, machine_cost, counted_cost, percent))
+    return result
+
+
+def time_label(moment: datetime) -> str:
+    days_ago = (datetime.now().astimezone().date() - moment.date()).days
+    day = {0: "today", 1: "yesterday"}.get(days_ago, f"{moment:%a %b} {moment.day}")
+    return f"{day} {moment:%H:%M}"
+
+
+def reset_label(moment: datetime) -> str:
+    # The API reports resets a fraction of a second before the boundary; show the boundary.
+    rounded = (moment + timedelta(seconds=30)).replace(second=0, microsecond=0)
+    return f"{rounded:%a %b} {rounded.day}, {rounded:%H:%M}"
+
+
+def limit_rows(
+    limits: Limits | None, error: str, machine_shares: list[Share], missing: list[str]
+) -> list[list[str]]:
+    if limits is None:
+        return [[bold("Limits"), paint(f"unavailable ({error or 'no machine returned them'})", "33")]]
+    rows = []
+    by_name = {share.window.name: share for share in machine_shares}
+    for name, label in (("7-day", "Weekly limit"), ("5-hour", "5-hour limit")):
+        share = by_name.get(name)
+        if share is None:
+            rows.append([bold(label), dim("no window open right now")])
+            continue
+        w = share.window
+        rows.append([bold(label), f"{usage_bar(w.percent, share.percent)}  "
+                                  f"{paint(f'{share.percent:.1f}%', '1', '35')} this machine · "
+                                  f"{w.percent:.0f}% whole account"])
+        rows.append([dim("  resets"), dim(reset_label(w.resets))])
+    if missing:
+        note = f"{', '.join(missing)} (this machine's share may be a bit high)"
+        rows.append([bold("Not counted"), paint(note, "33")])
+    return rows
+
+
+def print_summary(groups: dict[str, Totals], by: str, limit_info: list[list[str]], plan: str, detail: bool) -> None:
+    overall = Totals()
+    for t in groups.values():
+        overall.merge(t)
+    rows = list(limit_info)
+    plan_note = f"({plan} is a flat fee)" if plan else "(plans bill a flat fee)"
+    if groups:
+        rows += [
+            [bold("Cost"), f"{money(bold(dollars(overall)))} at API prices {dim(plan_note)}"],
+            [bold("Tokens"), f"{bold(human(overall.total))} {dim('·')} {human(overall.cache_read)} cache reads "
+                             f"{dim('·')} {human(overall.cache_write)} cache writes {dim('·')} "
+                             f"{human(overall.output)} output {dim('·')} {human(overall.input)} input"],
+            [bold("Last used"), time_label(overall.last)],
+        ]
+        if overall.unpriced:
+            unpriced = f"{overall.unpriced} replies from models without a known price"
+            rows.append([bold("Unpriced"), paint(unpriced, "33")])
+    else:
+        rows.append([bold("Usage"), dim("no Claude Code usage in this period")])
+    box(None, rows, set())
+    if groups:
+        header, group_lines, footer, right = group_rows(groups, detail)
+        print()
+        box([by.title(), *header], group_lines, right, footer)
+
+
+def round_to_total(values: list[float], total: float) -> list[float]:
+    """Rounds to tenths so the rounded values add up to the rounded total (largest remainder)."""
+    tenths = [v * 10 for v in values]
+    rounded = [int(t) for t in tenths]
+    short = round(total * 10) - sum(rounded)
+    by_remainder = sorted(range(len(values)), key=lambda i: tenths[i] - rounded[i], reverse=True)
+    for i in by_remainder[:max(short, 0)]:
+        rounded[i] += 1
+    return [r / 10 for r in rounded]
+
+
+def percent_cell(value: float | None) -> str:
+    if value is None:
+        return dim("–")
+    return dim("0.0%") if value == 0 else paint(f"{value:.1f}%", "1", "35")
+
+
+def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limits | None, limits_error: str,
+              since: datetime, period: str, as_json: bool, with_limits: bool) -> None:
+    """One table with a row per machine, plus the account's limits."""
+    everyone = [s.replies for s in sources.values()]
+    window_names = [w.name for w in limits.windows] if limits else []
+
+    @dataclass
+    class Row:
+        machine: Machine
+        status: str
+        totals: Totals
+        percents: dict[str, float]
+
+    rows: list[Row] = []
+    for m in machines:
+        source = sources.get(m.name)
+        status = "offline" if not m.online else "unreachable" if source is None else ""
+        totals = Totals()
+        percents: dict[str, float] = {}
+        if source is not None:
+            for reply in source.replies:
+                if reply.when >= since:
+                    totals.add(reply)
+            if limits:
+                percents = {s.window.name: s.percent for s in shares(limits, source.replies, everyone)}
+        rows.append(Row(m, status, totals, percents))
+    # Busiest first; machines that could not be read go last.
+    rows.sort(key=lambda r: (r.status != "", -r.totals.cost, r.machine.name))
+    other: dict[str, float] = {}
+    for w in limits.windows if limits else ():
+        attributed = sum(r.percents.get(w.name, 0.0) for r in rows)
+        other[w.name] = w.percent - attributed
+    # Per window, round the machine rows and the other row together so they add up to the account total.
+    shown: dict[str, list[float]] = {
+        w.name: round_to_total([r.percents.get(w.name, 0.0) for r in rows] + [other[w.name]], w.percent)
+        for w in (limits.windows if limits else ())
+    }
+    overall = Totals()
+    for r in rows:
+        overall.merge(r.totals)
+
+    if as_json:
+        print(json.dumps({
+            "period_start": since.isoformat(),
+            "plan": limits.plan if limits else None,
+            "limits": [{"window": w.name, "account_percent": w.percent, "other_apps_percent": other[w.name],
+                        "resets": w.resets.isoformat()} for w in (limits.windows if limits else ())],
+            "machines": [{"name": r.machine.name, "status": r.status or "ok", "replies": r.totals.replies,
+                          "tokens": r.totals.total, "api_usd": round(r.totals.cost, 4),
+                          "limit_percent": r.percents,
+                          "last": r.totals.last.isoformat() if r.totals.replies else None} for r in rows],
+        }, indent=2))
+        return
+
+    print(f"\n  {paint('All machines', '1', '36')} {dim('·')} {period}\n")
+    summary: list[list[str]] = []
+    if with_limits and limits is None:
+        summary.append([bold("Limits"), paint(f"unavailable ({limits_error or 'no machine returned them'})", "33")])
+    elif limits:
+        for name, label in (("7-day", "Weekly limit"), ("5-hour", "5-hour limit")):
+            window = next((w for w in limits.windows if w.name == name), None)
+            if window is None:
+                summary.append([bold(label), dim("no window open right now")])
+                continue
+            summary.append([bold(label), f"{usage_bar(window.percent, 0)}  {bold(f'{window.percent:.0f}%')} used "
+                                         f"{dim('· resets ' + reset_label(window.resets))}"])
+    plan_note = f"({limits.plan} is a flat fee)" if limits else "(plans bill a flat fee)"
+    summary.append([bold("Cost"), f"{money(bold(dollars(overall)))} at API prices {dim(plan_note)}"])
+    unread = [f"{r.machine.name} ({r.status})" for r in rows if r.status]
+    if unread:
+        note = f"{', '.join(unread)}: their usage is credited to the machines that were read"
+        summary.append([bold("Not counted"), paint(note, "33")])
+    box(None, summary, set())
+
+    header = ["Machine", *[{"7-day": "Weekly", "5-hour": "5-hour"}[n] for n in window_names],
+              "Replies", "Tokens", "Cost", "Last used"]
+    table: list[list[str]] = []
+    for index, r in enumerate(rows):
+        name = r.machine.name + (dim(" (here)") if r.machine.is_self else "")
+        if r.status:
+            table.append([dim(r.machine.name), *[dim("–") for _ in window_names], dim(r.status), dim("–"),
+                          dim("–"), dim("–")])
+            continue
+        used = r.totals.replies > 0
+        table.append([name, *[percent_cell(shown[n][index] if n in r.percents else None) for n in window_names],
+                      str(r.totals.replies),
+                      human(r.totals.total), money(dollars(r.totals)) if used else dim("$0.00"),
+                      time_label(r.totals.last) if used else dim("not used")])
+    if limits:
+        table.append([dim("Chats & other apps"), *[percent_cell(shown[n][-1]) for n in window_names],
+                      dim("–"), dim("–"), dim("–"), dim("–")])
+    account = [f"{round(w.percent, 1):.1f}%" for w in (limits.windows if limits else ())]
+    footer = ["Account", *account, str(overall.replies), human(overall.total), dollars(overall),
+              time_label(overall.last) if overall.replies else "–"]
+    print()
+    box(header, table, set(range(1, len(header) - 1)), footer)
+    print()
+
+
+def report(hosts: list[str], since: datetime, period: str, by: str, as_json: bool, with_limits: bool,
+           detail: bool, follow_week: bool) -> None:
+    all_machines = hosts == ["all"]
+    targets = ["local"] if all_machines or not hosts else hosts
+    machines = mesh_machines() if with_limits or all_machines else []
+    # Read far enough back to cover the 7-day window as well as --since.
+    earliest = min(since, datetime.now().astimezone() - timedelta(days=8)) if with_limits else since
+
+    def owner(host: str) -> str:
+        return next((m.name for m in machines if m.matches(host)), host)
+
+    sources_to_read = {owner(h): h for h in targets}
+    for m in machines:
+        if m.online and m.name not in sources_to_read:
+            sources_to_read[m.name] = "local" if m.is_self else m.name
+    missing = [f"{m.name} (offline)" for m in machines if not m.online]
+
+    # Files untouched since a day before the cutoff cannot hold newer replies.
+    file_cutoff = earliest - timedelta(days=1)
+    limits_from = owner(targets[0])
+
+    def read(item: tuple[str, str]) -> tuple[str, Source | FetchError]:
+        name, host = item
+        try:
+            source = read_source(host, file_cutoff, with_limits and name == limits_from)
+        except FetchError as error:
+            return name, error
+        source.replies = [r for r in source.replies if r.when >= earliest]
+        return name, source
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = dict(pool.map(read, sources_to_read.items()))
+
+    sources = {name: r for name, r in results.items() if isinstance(r, Source)}
+    for name, r in results.items():
+        if isinstance(r, FetchError):
+            missing.append(f"{name} (unreachable)")
+            if name in map(owner, targets):
+                print(f"tokens: {r}", file=sys.stderr)
+
+    limits_source = sources.get(limits_from)
+    limits = limits_source.limits if limits_source else None
+    limits_error = limits_source.limits_error if limits_source else "the machine could not be read"
+    everyone = [s.replies for s in sources.values()]
+
+    if all_machines:
+        listed = machines or [Machine("local", (), True, True)]
+        week = next((w for w in limits.windows if w.name == "7-day"), None) if limits else None
+        # Without --since, cover the limit's own week so every column describes the same period.
+        if follow_week and week is not None:
+            since, period = week.starts, f"limit week since {time_label(week.starts)}"
+        print_all(listed, sources, limits, limits_error, since, period, as_json, with_limits)
+        return
+
+    output: dict[str, object] = {}
+    for host in targets:
+        source = sources.get(owner(host))
+        if source is None:
+            continue
+        mine = [r for r in source.replies if r.when >= since]
+        groups = aggregate(mine, by)
+        machine_shares = shares(limits, source.replies, everyone) if limits else []
+        if as_json:
+            output[host] = {
+                "groups": {name: {"replies": t.replies, "input": t.input, "output": t.output,
+                                  "cache_write": t.cache_write, "cache_read": t.cache_read, "total": t.total,
+                                  "api_usd": round(t.cost, 4), "last": t.last.isoformat()}
+                           for name, t in groups.items()},
+                "limits": [{"window": s.window.name, "account_percent": s.window.percent,
+                            "machine_percent": round(s.percent, 2), "machine_api_usd": round(s.machine_cost, 4),
+                            "counted_api_usd": round(s.counted_cost, 4), "resets": s.window.resets.isoformat()}
+                           for s in machine_shares],
+                "not_counted": missing,
+            }
+            continue
+        print(f"\n  {paint(host, '1', '36')} {dim('·')} {period}\n")
+        info = limit_rows(limits, limits_error, machine_shares, missing) if with_limits else []
+        print_summary(groups, by, info, limits.plan if limits else "", detail)
+        print()
+    if as_json:
+        print(json.dumps(output, indent=2))
+
+
+def period_label(value: str) -> str:
+    if value == "today":
+        return "today"
+    match = re.fullmatch(r"(\d+)([hd])", value)
+    if match:
+        amount, unit = int(match.group(1)), "hour" if match.group(2) == "h" else "day"
+        return f"last {amount} {unit}{'s' if amount != 1 else ''}"
+    return f"since {value}"
+
+
+def parse_since(value: str) -> datetime:
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    if value == "today":
+        return today
+    match = re.fullmatch(r"(\d+)([hd])", value)
+    if match:
+        amount, unit = int(match.group(1)), match.group(2)
+        return datetime.now().astimezone() - (timedelta(hours=amount) if unit == "h" else timedelta(days=amount))
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").astimezone()
+    except ValueError:
+        raise argparse.ArgumentTypeError("use today, 12h, 7d or YYYY-MM-DD") from None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="tokens",
+        description="Show Claude Code token usage, its API price, and a machine's share of the plan limits.",
+    )
+    parser.add_argument("hosts", nargs="*",
+                        help="SSH hosts to check; 'local' or nothing means this machine, 'all' every machine")
+    parser.add_argument("--since", help="today, 12h, 7d or YYYY-MM-DD (default: 7d; for 'all', the limit week)")
+    parser.add_argument("--by", choices=GROUPINGS, default="day", help="how to group rows (default: day)")
+    parser.add_argument("--json", action="store_true", help="print JSON instead of text")
+    parser.add_argument("--detail", action="store_true",
+                        help="show every token type per row: input, output, cache write, cache read")
+    parser.add_argument("--no-limits", action="store_true",
+                        help="skip the plan limits, which read every machine on the tailnet")
+    parser.add_argument("--watch", type=int, metavar="SECONDS", help="refresh every SECONDS until Ctrl+C")
+    args = parser.parse_args()
+    since_value = args.since or "7d"
+    try:
+        since = parse_since(since_value)
+    except argparse.ArgumentTypeError as error:
+        parser.error(f"--since: {error}")
+
+    def run() -> None:
+        report(args.hosts, since, period_label(since_value), args.by, args.json,
+               with_limits=not args.no_limits, detail=args.detail, follow_week=args.since is None)
+
+    if args.watch is None:
+        run()
+        return
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            run()
+            print(f"refreshing every {args.watch}s, Ctrl+C to stop")
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

@@ -58,6 +58,41 @@ woken remotely.
   display still sleeps.
 - Linux: GNOME only (X11 or Wayland).
 
+## Claude Code token usage
+
+```sh
+tokens                               # this machine, last 7 days, one row per day
+tokens federicos-windows             # any machine you can SSH into: macOS, Linux or Windows
+tokens all                           # every machine in one table, with its share of the limits
+tokens federicos-desktop federicos-mac-mini --since today --by session
+tokens federicos-windows --watch 60  # refresh every minute
+tokens --detail                      # every token type per row
+tokens --json                        # machine-readable
+tokens --no-limits                   # skip the plan limits (faster, reads only the named machines)
+```
+
+`--since` takes `today`, `12h`, `7d` or a date; `--by` takes `day`, `model`, `session`
+or `project`. It reads the reply logs Claude Code keeps in `~/.claude/projects` (over
+SSH for other machines, nothing is installed there) and counts each API reply once:
+input, output, cache write and cache read tokens.
+
+- **API $** is what those tokens would cost at Anthropic's API list prices, kept in
+  `PRICES` at the top of the script. A plan bills a flat fee instead.
+- **Limits**: the 5-hour and 7-day limits belong to the account, which every machine
+  shares. `tokens` asks Anthropic for the account's percentages (the numbers Claude
+  Code's `/usage` shows, fetched on the checked machine with its own login), reads every
+  online tailnet machine, and estimates a machine's part as the account percentage times
+  that machine's share of the API-priced Claude Code usage in the same window. Offline
+  machines are listed as not counted, since their usage would otherwise be credited to
+  the others.
+- **`tokens all`** lists every tailnet machine with its share of each limit, plus a
+  "Chats & other apps" row for account usage outside Claude Code; the rows add up to the
+  account total (rounded with the largest-remainder method). Without `--since` it covers
+  the current limit week, so every column describes the same period.
+
+Colors turn off when the output is piped or `NO_COLOR` is set; `FORCE_COLOR=1` keeps them.
+Needs `python3` on the machine running it and on macOS or Linux machines it reads limits from.
+
 ## Agent config sync
 
 Bootstrap also installs Syncthing and shares `~/.claude` with the other machines,
