@@ -454,7 +454,9 @@ def main() -> None:
     except Exception:  # noqa: BLE001 - a broken tokens install must not blank the status line
         tokens = None
     devices = read_devices(tokens)
-    for line in (session_line(data, tokens), limits_line(data, devices), devices_line(devices),
+    # A bare reset code renders as a blank line; Claude Code drops lines that are truly empty.
+    spacer = "\033[0m"
+    for line in (session_line(data, tokens), spacer, limits_line(data, devices), devices_line(devices),
                  place_line(data)):
         print(line)
 
