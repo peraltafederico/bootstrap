@@ -453,9 +453,7 @@ def main() -> None:
     except Exception:  # noqa: BLE001 - a broken tokens install must not blank the status line
         tokens = None
     devices = read_devices(tokens)
-    # Claude Code drops blank lines, so the spacer is a blank braille cell, which is not whitespace.
-    spacer = "\u2800"
-    for line in (session_line(data, tokens), spacer, limits_line(data, devices), devices_line(devices),
+    for line in (session_line(data, tokens), limits_line(data, devices), devices_line(devices),
                  place_line(data)):
         print(line)
 
