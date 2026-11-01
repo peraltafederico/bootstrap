@@ -50,6 +50,8 @@ LOCK_STALE = 120
 BAR = 10
 
 DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN = "90", "31", "32", "33", "34", "35", "36"
+# The week and device lines use brighter tones: plain magenta and dark gray were hard to read on dark themes.
+MINE, LABEL, OTHER = "1;95", "37", "97"
 SEP = f" \033[{DIM}m·\033[0m "
 
 
@@ -69,8 +71,8 @@ def bar(percent: float, mine: float = 0.0) -> str:
     """███░░░░░░░ out of 100%, with this machine's part in magenta at the start."""
     filled = round(min(max(percent, 0.0), 100.0) / 100 * BAR)
     mine_cells = min(filled, max(1 if mine > 0 else 0, round(mine / 100 * BAR)))
-    return (paint("█" * mine_cells, MAGENTA) + paint("█" * (filled - mine_cells), level(percent))
-            + paint("░" * (BAR - filled), DIM))
+    return (paint("█" * mine_cells, MINE) + paint("█" * (filled - mine_cells), level(percent))
+            + paint("░" * (BAR - filled), LABEL))
 
 
 def compact(n: float) -> str:
@@ -424,34 +426,34 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
         here = mine if key == "seven_day" and devices else 0.0
         when = moment(resets) if resets else ""
         parts.append(f"{label} {bar(percent, here)} {paint(f'{percent:.0f}%', level(percent))}"
-                     + (paint(f" resets {when}", DIM) if when else ""))
+                     + (paint(f" resets {when}", LABEL) if when else ""))
     if devices and devices.plan:
-        parts.append(paint(devices.plan, DIM))
+        parts.append(paint(devices.plan, LABEL))
     if devices and devices.renews:
-        parts.append(f"{paint('cycle', DIM)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
-                     f"{paint(compact(devices.cycle_tokens) + ' tok', DIM)} "
-                     f"{paint(f'renews {moment(devices.renews)}', DIM)}")
+        parts.append(f"{paint('cycle', LABEL)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
+                     f"{paint(compact(devices.cycle_tokens) + ' tok', LABEL)} "
+                     f"{paint(f'renews {moment(devices.renews)}', LABEL)}")
     return SEP.join(parts)
 
 
 def devices_line(devices: Devices | None) -> str:
     if devices is None:
-        return paint("device reading every machine…", DIM)
-    # This machine first, in magenta like its part of the week bar; the rest busiest first.
+        return paint("device reading every machine…", LABEL)
+    # This machine first, in bright magenta like its part of the week bar; the rest busiest first.
     used = sorted((d for d in devices.machines if d.status == "ok" and (d.share > 0 or d.here)),
                   key=lambda d: (not d.here, -d.share))
-    parts = [paint("device", DIM)]
+    parts = [paint("device", LABEL)]
     for d in used:
         text = f"{short_name(d.name)} {d.share:.1f}%"
-        parts.append(paint(text, MAGENTA) if d.here else text)
-    parts.append(paint(f"chats & apps {devices.other:.1f}%", DIM))
+        parts.append(paint(text, MINE if d.here else OTHER))
+    parts.append(paint(f"chats & apps {devices.other:.1f}%", LABEL))
     idle = sum(1 for d in devices.machines if d.status == "ok" and d not in used)
     unread = [short_name(d.name) for d in devices.machines if d.status != "ok"]
     if idle:
-        parts.append(paint(f"{idle} idle", DIM))
+        parts.append(paint(f"{idle} idle", LABEL))
     if unread:
         parts.append(paint(f"not counted: {', '.join(unread)}", YELLOW))
-    parts.append(paint(ago(devices.age), DIM))
+    parts.append(paint(ago(devices.age), LABEL))
     return SEP.join(parts)
 
 
