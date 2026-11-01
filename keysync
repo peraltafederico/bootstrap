@@ -12,6 +12,8 @@ AUTH_KEYS="${KEYSYNC_AUTHORIZED_KEYS:-$HOME/.ssh/authorized_keys}"
 KEYS_URL="https://github.com/$GITHUB_USER.keys"
 BEGIN_MARK="# >>> keysync: $KEYS_URL >>>"
 END_MARK="# <<< keysync <<<"
+# What keysync --all runs on Windows peers, where keysync.ps1 -Install puts it.
+WINDOWS_KEYSYNC='powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\ProgramData\keysync\keysync.ps1'
 # Anything that is not one of these key types means GitHub sent something unexpected.
 KEY_LINE='^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) '
 
@@ -78,12 +80,20 @@ sync_all() {
     return 1
   fi
   # Columns: ip, name, user, os, status. Phones have no SSH server, offline peers cannot answer.
-  peers="$("$ts" status --self=false | awk '$1 ~ /^100\./ && $4 != "android" && $4 != "iOS" && $0 !~ /offline/ { print $2 }')"
+  peers="$("$ts" status --self=false | awk '$1 ~ /^100\./ && $4 != "android" && $4 != "iOS" && $0 !~ /offline/ { print $2 ":" $4 }')"
 
-  for peer in $peers; do
+  local entry os remote_cmd
+  for entry in $peers; do
+    peer="${entry%:*}"
+    os="${entry##*:}"
+    # shellcheck disable=SC2016 # $HOME expands on the peer, not here
+    remote_cmd='"$HOME/.local/bin/keysync"'
+    # Windows peers run keysync.ps1 from its install dir; their SSH user comes from ~/.ssh/config.
+    [ "$os" = windows ] && remote_cmd="$WINDOWS_KEYSYNC"
     # The tailnet already authenticates peers, so trusting a host key on first contact is safe here.
+    # shellcheck disable=SC2029 # remote_cmd is one of two fixed strings, expanded here on purpose
     if ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
-      "$peer" '"$HOME/.local/bin/keysync"' 2> /dev/null; then
+      "$peer" "$remote_cmd" 2> /dev/null; then
       log "$peer: synced"
     else
       status=$?
