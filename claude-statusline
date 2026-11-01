@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Claude Code status line: model, context, account limits, every machine's share, folder and PR.
+
+Claude Code pipes a JSON description of the session on stdin and shows what this prints.
+Slow data (every machine's usage from `tokens all`, the branch's PR) comes from a cache that a
+detached copy of this script refreshes in the background, so a render never waits on SSH or gh.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Protocol, cast
+
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "claude-statusline"
+DEVICES_TTL = 300
+PR_TTL = 120
+# A refresh that fails keeps its lock until it goes stale, which spaces out retries.
+LOCK_STALE = 120
+BAR = 10
+
+DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN = "90", "31", "32", "33", "34", "35", "36"
+SEP = f" \033[{DIM}m·\033[0m "
+
+
+def paint(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if text else ""
+
+
+def link(url: str, text: str) -> str:
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
+def level(percent: float) -> str:
+    return GREEN if percent < 50 else YELLOW if percent < 80 else RED
+
+
+def bar(percent: float, mine: float = 0.0) -> str:
+    """███░░░░░░░ out of 100%, with this machine's part in magenta at the start."""
+    filled = round(min(max(percent, 0.0), 100.0) / 100 * BAR)
+    mine_cells = min(filled, max(1 if mine > 0 else 0, round(mine / 100 * BAR)))
+    return (paint("█" * mine_cells, MAGENTA) + paint("█" * (filled - mine_cells), level(percent))
+            + paint("░" * (BAR - filled), DIM))
+
+
+def compact(n: float) -> str:
+    for size, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if n >= size:
+            return f"{n / size:.1f}".removesuffix(".0") + suffix
+    return str(round(n))
+
+
+def as_dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def as_list(value: object) -> list[object]:
+    return cast(list[object], value) if isinstance(value, list) else []
+
+
+def as_float(value: object) -> float | None:
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
+def as_str(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+# --- shared code from tokens -------------------------------------------------------------------
+
+
+class Price(Protocol):
+    input: float
+    cache_read: float
+
+
+@dataclass(frozen=True)
+class Tokens:
+    path: Path
+    prices: dict[str, Price]
+    cache_write_5m: float
+    cache_write_1h: float
+    round_to_total: Callable[[list[float], float], list[float]]
+
+
+def load_tokens() -> Tokens | None:
+    """Prices and helpers from the tokens script installed next to this one."""
+    sibling = Path(__file__).resolve().parent / "tokens"
+    found = str(sibling) if sibling.is_file() else shutil.which("tokens")
+    if not found:
+        return None
+    loader = importlib.machinery.SourceFileLoader("tokens_cli", found)
+    spec = importlib.util.spec_from_loader("tokens_cli", loader)
+    if spec is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["tokens_cli"] = module
+    loader.exec_module(module)
+    # tokens has no .py name, so mypy types its attributes as Any; the casts restate their real types.
+    return Tokens(
+        path=Path(found),
+        prices=cast(dict[str, Price], module.PRICES),
+        cache_write_5m=cast(float, module.CACHE_WRITE_5M),
+        cache_write_1h=cast(float, module.CACHE_WRITE_1H),
+        round_to_total=cast(Callable[[list[float], float], list[float]], module.round_to_total),
+    )
+
+
+# --- background refresh ------------------------------------------------------------------------
+
+
+def age(path: Path) -> float | None:
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def refresh(cache: Path, ttl: int, command: list[str], cwd: str | None = None, empty_on_error: bool = False) -> None:
+    """Starts a detached refresh of cache when it is older than ttl and no refresh is running."""
+    cache_age = age(cache)
+    if cache_age is not None and cache_age < ttl:
+        return
+    lock = cache.with_name(cache.name + ".lock")
+    lock_age = age(lock)
+    if lock_age is not None:
+        if lock_age < LOCK_STALE:
+            return
+        lock.unlink(missing_ok=True)
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except OSError:
+        return
+    argv = [sys.executable, str(Path(__file__).resolve()), "--refresh", str(cache),
+            "empty" if empty_on_error else "keep", *command]
+    try:
+        if os.name == "nt":
+            detached = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=detached)
+        else:
+            subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        lock.unlink(missing_ok=True)
+
+
+def run_refresh(cache: Path, on_error: str, command: list[str]) -> None:
+    """The detached half of refresh: runs command and stores its output."""
+    lock = cache.with_name(cache.name + ".lock")
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=180, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if result.returncode == 0:
+        write_atomic(cache, result.stdout)
+    elif on_error == "empty":
+        write_atomic(cache, b"")
+    else:
+        return
+    lock.unlink(missing_ok=True)
+
+
+# --- transcript --------------------------------------------------------------------------------
+
+
+@dataclass
+class Session:
+    """What the transcript says so far; kept per session so each render reads only new lines."""
+
+    path: str = ""
+    offset: int = 0
+    compactions: int = 0
+    last_reply: float = 0.0
+    cache_ttl: int = 300
+
+
+def read_session(session_id: str, transcript: str) -> Session:
+    state_file = CACHE / "sessions" / f"{re.sub(r'[^A-Za-z0-9._-]', '', session_id) or 'none'}.json"
+    try:
+        state = Session(**json.loads(state_file.read_text()))
+    except (OSError, ValueError, TypeError):
+        state = Session()
+    try:
+        size = os.path.getsize(transcript)
+    except OSError:
+        return state
+    if state.path != transcript or size < state.offset:
+        state = Session(path=transcript)
+    if size == state.offset:
+        return state
+    with open(transcript, "rb") as fh:
+        fh.seek(state.offset)
+        chunk = fh.read()
+    complete = chunk.rfind(b"\n") + 1
+    for raw in chunk[:complete].splitlines():
+        if b'"compact_boundary"' in raw:
+            state.compactions += 1
+            continue
+        if b'"usage"' not in raw or b'"assistant"' not in raw:
+            continue
+        try:
+            entry = as_dict(json.loads(raw))
+        except ValueError:
+            continue
+        when = as_str(entry.get("timestamp"))
+        try:
+            state.last_reply = max(state.last_reply, datetime.fromisoformat(when).timestamp())
+        except ValueError:
+            pass
+        written = as_dict(as_dict(as_dict(entry.get("message")).get("usage")).get("cache_creation"))
+        if as_float(written.get("ephemeral_1h_input_tokens")):
+            state.cache_ttl = 3600
+        elif as_float(written.get("ephemeral_5m_input_tokens")):
+            state.cache_ttl = 300
+    state.offset += complete
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(state_file, json.dumps(asdict(state)).encode())
+    except OSError:
+        pass
+    return state
+
+
+# --- lines -------------------------------------------------------------------------------------
+
+
+def context_tokens(ctx: dict[str, object]) -> float | None:
+    usage = as_dict(ctx.get("current_usage"))
+    parts = [as_float(usage.get(k)) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+    if any(p for p in parts):
+        return sum(p or 0 for p in parts)
+    percent, size = as_float(ctx.get("used_percentage")), as_float(ctx.get("context_window_size"))
+    return percent / 100 * size if percent is not None and size else None
+
+
+def session_line(data: dict[str, object], tokens: Tokens | None) -> str:
+    model = as_dict(data.get("model"))
+    model_id = as_str(model.get("id"))
+    parts = [paint(as_str(model.get("display_name")) or model_id or "?", CYAN)]
+    effort = data.get("effort")
+    effort_level = as_str(as_dict(effort).get("level")) or as_str(effort)
+    if effort_level:
+        parts.append(paint(effort_level, MAGENTA))
+
+    ctx = as_dict(data.get("context_window"))
+    percent = as_float(ctx.get("used_percentage"))
+    used, size = context_tokens(ctx), as_float(ctx.get("context_window_size"))
+    if percent is not None:
+        amount = paint(f" {compact(used)}/{compact(size)}", DIM) if used and size else ""
+        parts.append(f"ctx {bar(percent)} {paint(f'{percent:.0f}%', level(percent))}{amount}")
+
+    state = read_session(as_str(data.get("session_id")), as_str(data.get("transcript_path")))
+    parts.append(paint(f"compactions {state.compactions}", YELLOW if state.compactions else DIM))
+    cost = as_float(as_dict(data.get("cost")).get("total_cost_usd"))
+    if cost is not None:
+        parts.append(paint(f"session ${cost:,.2f}", MAGENTA))
+
+    if state.last_reply:
+        expires = state.last_reply + state.cache_ttl
+        warm = time.time() < expires
+        cache = (paint(f"cache warm till {datetime.fromtimestamp(expires).strftime('%H:%M')}", GREEN) if warm
+                 else paint("cache cold", RED))
+        price = tokens.prices.get(re.sub(r"(-\d{8}|\[\w+\])$", "", model_id)) if tokens else None
+        if tokens and price and used:
+            write = tokens.cache_write_1h if state.cache_ttl == 3600 else tokens.cache_write_5m
+            cold, hot = used * price.input * write / 1e6, used * price.cache_read / 1e6
+            cache += paint(f" re-cache ≈${cold:.2f} vs ${hot:.2f}", DIM)
+        parts.append(cache)
+    return SEP.join(parts)
+
+
+@dataclass(frozen=True)
+class Device:
+    name: str
+    here: bool
+    status: str
+    share: float
+
+
+@dataclass(frozen=True)
+class Devices:
+    plan: str
+    week: float | None
+    week_resets: datetime | None
+    other: float
+    machines: list[Device]
+    age: float
+
+
+def read_devices(tokens: Tokens | None) -> Devices | None:
+    cache = CACHE / "devices.json"
+    if tokens:
+        refresh(cache, DEVICES_TTL, [sys.executable, str(tokens.path), "all", "--json"])
+    cache_age = age(cache)
+    try:
+        payload = as_dict(json.loads(cache.read_text()))
+    except (OSError, ValueError):
+        return None
+    week = next((as_dict(w) for w in as_list(payload.get("limits")) if as_dict(w).get("window") == "7-day"), {})
+    machines = [as_dict(m) for m in as_list(payload.get("machines"))]
+    account = as_float(week.get("account_percent"))
+    shares = [as_float(as_dict(m.get("limit_percent")).get("7-day")) or 0.0 for m in machines]
+    other = as_float(week.get("other_apps_percent")) or 0.0
+    if account is not None and tokens:
+        *shares, other = tokens.round_to_total([*shares, other], account)
+    try:
+        resets: datetime | None = datetime.fromisoformat(as_str(week.get("resets")))
+    except ValueError:
+        resets = None
+    return Devices(
+        plan=as_str(payload.get("plan")),
+        week=account,
+        week_resets=resets,
+        other=other,
+        machines=[Device(as_str(m.get("name")), m.get("here") is True, as_str(m.get("status")), s)
+                  for m, s in zip(machines, shares, strict=True)],
+        age=cache_age or 0.0,
+    )
+
+
+def short_name(name: str) -> str:
+    return re.sub(r"^federicos?-", "", name)
+
+
+def moment(when: datetime) -> str:
+    """22:03 today, Thu 23:00 within a week, Nov 12 later."""
+    local = when.astimezone()
+    days = (local.date() - datetime.now().astimezone().date()).days
+    if days == 0:
+        return local.strftime("%H:%M")
+    return local.strftime("%a %H:%M") if days < 7 else f"{local:%b} {local.day}"
+
+
+def ago(seconds: float) -> str:
+    return "just now" if seconds < 60 else f"{seconds / 60:.0f}m ago" if seconds < 3600 else f"{seconds / 3600:.0f}h ago"
+
+
+def limits_line(data: dict[str, object], devices: Devices | None) -> str:
+    limits = as_dict(data.get("rate_limits"))
+    mine = next((d.share for d in devices.machines if d.here), 0.0) if devices else 0.0
+    parts: list[str] = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "week")):
+        window = as_dict(limits.get(key))
+        percent = as_float(window.get("used_percentage"))
+        resets_at = as_float(window.get("resets_at"))
+        resets = datetime.fromtimestamp(resets_at).astimezone() if resets_at else None
+        if percent is None and key == "seven_day" and devices and devices.week is not None:
+            percent, resets = devices.week, devices.week_resets
+        if percent is None:
+            parts.append(paint(f"{label} no window open", DIM))
+            continue
+        here = mine if key == "seven_day" and devices else 0.0
+        when = moment(resets) if resets else ""
+        parts.append(f"{label} {bar(percent, here)} {paint(f'{percent:.0f}%', level(percent))}"
+                     + (paint(f" resets {when}", DIM) if when else ""))
+    if devices and devices.plan:
+        parts.append(paint(devices.plan, DIM))
+    return SEP.join(parts)
+
+
+def devices_line(devices: Devices | None) -> str:
+    if devices is None:
+        return paint("devices: reading every machine…", DIM)
+    used = sorted((d for d in devices.machines if d.status == "ok" and (d.share > 0 or d.here)),
+                  key=lambda d: -d.share)
+    parts = [paint("week by device", DIM)]
+    for d in used:
+        text = f"{short_name(d.name)} {d.share:.1f}%"
+        parts.append(paint(text + " (here)", MAGENTA) if d.here else text)
+    parts.append(paint(f"chats & apps {devices.other:.1f}%", DIM))
+    idle = sum(1 for d in devices.machines if d.status == "ok" and d not in used)
+    unread = [short_name(d.name) for d in devices.machines if d.status != "ok"]
+    if idle:
+        parts.append(paint(f"{idle} idle", DIM))
+    if unread:
+        parts.append(paint(f"not counted: {', '.join(unread)}", YELLOW))
+    parts.append(paint(ago(devices.age), DIM))
+    return SEP.join(parts)
+
+
+def git_branch(cwd: str) -> str:
+    try:
+        return subprocess.run(["git", "-C", cwd, "branch", "--show-current"], capture_output=True, text=True,
+                              timeout=0.5, check=False).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def pull_request(cwd: str, branch: str) -> str:
+    gh = shutil.which("gh")
+    if not gh or not branch:
+        return ""
+    key = re.sub(r"[^A-Za-z0-9._-]", "_", f"{cwd}__{branch}")
+    cache = CACHE / "prs" / f"{key}.json"
+    refresh(cache, PR_TTL, [gh, "pr", "view", "--json", "number,url,state"], cwd=cwd, empty_on_error=True)
+    try:
+        pr = as_dict(json.loads(cache.read_text() or "{}"))
+    except (OSError, ValueError):
+        return ""
+    number, url = as_float(pr.get("number")), as_str(pr.get("url"))
+    if not number or not url:
+        return ""
+    color = {"OPEN": GREEN, "MERGED": MAGENTA, "CLOSED": RED}.get(as_str(pr.get("state")), BLUE)
+    return link(url, paint(f"PR #{number:.0f}", color))
+
+
+def place_line(data: dict[str, object]) -> str:
+    workspace = as_dict(data.get("workspace"))
+    cwd = as_str(data.get("cwd")) or as_str(workspace.get("current_dir"))
+    home = str(Path.home())
+    shown = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
+    parts = [paint(shown, BLUE)]
+    branch = git_branch(cwd) if cwd else ""
+    if branch:
+        parts.append(f"⎇ {branch}")
+    worktree = as_str(workspace.get("git_worktree"))
+    if worktree:
+        parts.append(paint(f"worktree {worktree}", MAGENTA))
+    pr = pull_request(cwd, branch) if cwd else ""
+    if pr:
+        parts.append(pr)
+    return SEP.join(parts)
+
+
+def main() -> None:
+    if sys.argv[1:2] == ["--refresh"]:
+        run_refresh(Path(sys.argv[2]), sys.argv[3], sys.argv[4:])
+        return
+    try:
+        data = as_dict(json.load(sys.stdin))
+    except ValueError:
+        data = {}
+    try:
+        tokens = load_tokens()
+    except Exception:  # noqa: BLE001 - a broken tokens install must not blank the status line
+        tokens = None
+    devices = read_devices(tokens)
+    for line in (session_line(data, tokens), limits_line(data, devices), devices_line(devices),
+                 place_line(data)):
+        print(line)
+
+
+if __name__ == "__main__":
+    main()

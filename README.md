@@ -93,6 +93,22 @@ input, output, cache write and cache read tokens.
 Colors turn off when the output is piped or `NO_COLOR` is set; `FORCE_COLOR=1` keeps them.
 Needs `python3` on the machine running it and on macOS or Linux machines it reads limits from.
 
+## Claude Code status line
+
+`claude-statusline` is Claude Code's status line on every machine. It prints four lines:
+
+1. Model, effort, context as a `███░░░░░░░` bar with tokens used, compactions in this session,
+   the session's API-priced cost, and whether the prompt cache is still warm (with what a
+   re-cache would cost against a cache hit).
+2. The account's 5-hour and weekly limits as bars, with reset times. The magenta part of the
+   weekly bar is this machine's share.
+3. Every machine's share of the weekly limit, from `tokens all --json`.
+4. Folder, git branch, worktree and the branch's PR (a link).
+
+Lines 1 and 2 come from what Claude Code sends the script, so they are always current. Reading
+every machine takes several seconds, so line 3 shows a cache in `~/.cache/claude-statusline` that a
+detached copy of the script refreshes at most every 5 minutes; the PR is cached for 2 minutes.
+
 ## Agent config sync
 
 Bootstrap also installs Syncthing and shares `~/.claude` with the other machines,
