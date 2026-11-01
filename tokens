@@ -41,6 +41,11 @@ class Reply:
     output: int
     cache_write: int
     cache_read: int
+    # Forked subagent logs can copy a reply while it is still streaming: same key, partial usage.
+    finished: bool
+
+    def better_than(self, other: Reply) -> bool:
+        return (self.finished, self.output) > (other.finished, other.output)
 
 
 @dataclass
@@ -93,8 +98,10 @@ def parse_reply(line: str) -> Reply | None:
         return None
     message = as_dict(record.get("message"))
     usage = as_dict(message.get("usage"))
-    is_logged_reply = record.get("type") == "assistant" and bool(usage)
-    if not is_logged_reply:
+    model = as_str(message.get("model"))
+    # API errors and <synthetic> placeholders are logged as replies with zero usage.
+    is_real_reply = record.get("type") == "assistant" and bool(usage) and model != "<synthetic>"
+    if not is_real_reply:
         return None
     try:
         when = datetime.fromisoformat(as_str(record.get("timestamp")).replace("Z", "+00:00")).astimezone()
@@ -105,13 +112,14 @@ def parse_reply(line: str) -> Reply | None:
         # Claude Code writes one line per content block, all repeating the same message id and usage.
         key=f"{as_str(message.get('id'))}:{as_str(record.get('requestId'))}",
         when=when,
-        model=as_str(message.get("model")) or "unknown",
+        model=model or "unknown",
         session=as_str(record.get("sessionId")),
         project=re.split(r"[\\/]", cwd.rstrip("\\/"))[-1] if cwd else "unknown",
         input=as_int(usage.get("input_tokens")),
         output=as_int(usage.get("output_tokens")),
         cache_write=as_int(usage.get("cache_creation_input_tokens")),
         cache_read=as_int(usage.get("cache_read_input_tokens")),
+        finished=message.get("stop_reason") is not None,
     )
 
 
@@ -177,7 +185,10 @@ def collect(lines: Iterable[str], since: datetime) -> list[Reply]:
     replies: dict[str, Reply] = {}
     for line in lines:
         reply = parse_reply(line)
-        if reply and reply.when >= since:
+        if reply is None or reply.when < since:
+            continue
+        seen = replies.get(reply.key)
+        if seen is None or reply.better_than(seen):
             replies[reply.key] = reply
     return sorted(replies.values(), key=lambda r: r.when)
 
