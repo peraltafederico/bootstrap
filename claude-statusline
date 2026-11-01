@@ -378,13 +378,14 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
 
 def devices_line(devices: Devices | None) -> str:
     if devices is None:
-        return paint("devices reading every machine…", DIM)
+        return paint("device reading every machine…", DIM)
+    # This machine first, in magenta like its part of the week bar; the rest busiest first.
     used = sorted((d for d in devices.machines if d.status == "ok" and (d.share > 0 or d.here)),
-                  key=lambda d: -d.share)
+                  key=lambda d: (not d.here, -d.share))
     parts = [paint("device", DIM)]
     for d in used:
         text = f"{short_name(d.name)} {d.share:.1f}%"
-        parts.append(paint(text + " (here)", MAGENTA) if d.here else text)
+        parts.append(paint(text, MAGENTA) if d.here else text)
     parts.append(paint(f"chats & apps {devices.other:.1f}%", DIM))
     idle = sum(1 for d in devices.machines if d.status == "ok" and d not in used)
     unread = [short_name(d.name) for d in devices.machines if d.status != "ok"]
