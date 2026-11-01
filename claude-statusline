@@ -381,7 +381,7 @@ def devices_line(devices: Devices | None) -> str:
         return paint("devices reading every machine…", DIM)
     used = sorted((d for d in devices.machines if d.status == "ok" and (d.share > 0 or d.here)),
                   key=lambda d: -d.share)
-    parts = [paint("devices", DIM)]
+    parts = [paint("device", DIM)]
     for d in used:
         text = f"{short_name(d.name)} {d.share:.1f}%"
         parts.append(paint(text + " (here)", MAGENTA) if d.here else text)
