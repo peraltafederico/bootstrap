@@ -63,6 +63,7 @@ woken remotely.
 ```sh
 tokens                               # this machine, last 7 days, one row per day
 tokens federicos-windows             # any machine you can SSH into: macOS, Linux or Windows
+tokens all                           # every machine in one table, with its share of the limits
 tokens federicos-desktop federicos-mac-mini --since today --by session
 tokens federicos-windows --watch 60  # refresh every minute
 tokens --detail                      # every token type per row
@@ -84,6 +85,10 @@ input, output, cache write and cache read tokens.
   that machine's share of the API-priced Claude Code usage in the same window. Offline
   machines are listed as not counted, since their usage would otherwise be credited to
   the others.
+- **`tokens all`** lists every tailnet machine with its share of each limit, plus a
+  "Chats & other apps" row for account usage outside Claude Code; the rows add up to the
+  account total (rounded with the largest-remainder method). Without `--since` it covers
+  the current limit week, so every column describes the same period.
 
 Colors turn off when the output is piped or `NO_COLOR` is set; `FORCE_COLOR=1` keeps them.
 Needs `python3` on the machine running it and on macOS or Linux machines it reads limits from.

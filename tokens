@@ -4,6 +4,7 @@
   tokens                          this machine, last 7 days, by day
   tokens federicos-windows        a mesh machine over SSH (macOS, Linux or Windows)
   tokens --since today --by session
+  tokens all                      every machine in one table, with its share of the limits
   tokens win --watch 60           refresh every 60 seconds
 
 Claude Code logs every reply, with its token usage, to ~/.claude/projects/**/*.jsonl.
@@ -643,10 +644,127 @@ def print_summary(groups: dict[str, Totals], by: str, limit_info: list[list[str]
         box([by.title(), *header], group_lines, right, footer)
 
 
+def round_to_total(values: list[float], total: float) -> list[float]:
+    """Rounds to tenths so the rounded values add up to the rounded total (largest remainder)."""
+    tenths = [v * 10 for v in values]
+    rounded = [int(t) for t in tenths]
+    short = round(total * 10) - sum(rounded)
+    by_remainder = sorted(range(len(values)), key=lambda i: tenths[i] - rounded[i], reverse=True)
+    for i in by_remainder[:max(short, 0)]:
+        rounded[i] += 1
+    return [r / 10 for r in rounded]
+
+
+def percent_cell(value: float | None) -> str:
+    if value is None:
+        return dim("–")
+    return dim("0.0%") if value == 0 else paint(f"{value:.1f}%", "1", "35")
+
+
+def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limits | None, limits_error: str,
+              since: datetime, period: str, as_json: bool, with_limits: bool) -> None:
+    """One table with a row per machine, plus the account's limits."""
+    everyone = [s.replies for s in sources.values()]
+    window_names = [w.name for w in limits.windows] if limits else []
+
+    @dataclass
+    class Row:
+        machine: Machine
+        status: str
+        totals: Totals
+        percents: dict[str, float]
+
+    rows: list[Row] = []
+    for m in machines:
+        source = sources.get(m.name)
+        status = "offline" if not m.online else "unreachable" if source is None else ""
+        totals = Totals()
+        percents: dict[str, float] = {}
+        if source is not None:
+            for reply in source.replies:
+                if reply.when >= since:
+                    totals.add(reply)
+            if limits:
+                percents = {s.window.name: s.percent for s in shares(limits, source.replies, everyone)}
+        rows.append(Row(m, status, totals, percents))
+    # Busiest first; machines that could not be read go last.
+    rows.sort(key=lambda r: (r.status != "", -r.totals.cost, r.machine.name))
+    other: dict[str, float] = {}
+    for w in limits.windows if limits else ():
+        attributed = sum(r.percents.get(w.name, 0.0) for r in rows)
+        other[w.name] = w.percent - attributed
+    # Per window, round the machine rows and the other row together so they add up to the account total.
+    shown: dict[str, list[float]] = {
+        w.name: round_to_total([r.percents.get(w.name, 0.0) for r in rows] + [other[w.name]], w.percent)
+        for w in (limits.windows if limits else ())
+    }
+    overall = Totals()
+    for r in rows:
+        overall.merge(r.totals)
+
+    if as_json:
+        print(json.dumps({
+            "period_start": since.isoformat(),
+            "plan": limits.plan if limits else None,
+            "limits": [{"window": w.name, "account_percent": w.percent, "other_apps_percent": other[w.name],
+                        "resets": w.resets.isoformat()} for w in (limits.windows if limits else ())],
+            "machines": [{"name": r.machine.name, "status": r.status or "ok", "replies": r.totals.replies,
+                          "tokens": r.totals.total, "api_usd": round(r.totals.cost, 4),
+                          "limit_percent": r.percents,
+                          "last": r.totals.last.isoformat() if r.totals.replies else None} for r in rows],
+        }, indent=2))
+        return
+
+    print(f"\n  {paint('All machines', '1', '36')} {dim('·')} {period}\n")
+    summary: list[list[str]] = []
+    if with_limits and limits is None:
+        summary.append([bold("Limits"), paint(f"unavailable ({limits_error or 'no machine returned them'})", "33")])
+    elif limits:
+        for name, label in (("7-day", "Weekly limit"), ("5-hour", "5-hour limit")):
+            window = next((w for w in limits.windows if w.name == name), None)
+            if window is None:
+                summary.append([bold(label), dim("no window open right now")])
+                continue
+            summary.append([bold(label), f"{usage_bar(window.percent, 0)}  {bold(f'{window.percent:.0f}%')} used "
+                                         f"{dim('· resets ' + reset_label(window.resets))}"])
+    plan_note = f"({limits.plan} is a flat fee)" if limits else "(plans bill a flat fee)"
+    summary.append([bold("Cost"), f"{money(bold(dollars(overall)))} at API prices {dim(plan_note)}"])
+    unread = [f"{r.machine.name} ({r.status})" for r in rows if r.status]
+    if unread:
+        note = f"{', '.join(unread)}: their usage is credited to the machines that were read"
+        summary.append([bold("Not counted"), paint(note, "33")])
+    box(None, summary, set())
+
+    header = ["Machine", *[{"7-day": "Weekly", "5-hour": "5-hour"}[n] for n in window_names],
+              "Replies", "Tokens", "Cost", "Last used"]
+    table: list[list[str]] = []
+    for index, r in enumerate(rows):
+        name = r.machine.name + (dim(" (here)") if r.machine.is_self else "")
+        if r.status:
+            table.append([dim(r.machine.name), *[dim("–") for _ in window_names], dim(r.status), dim("–"),
+                          dim("–"), dim("–")])
+            continue
+        used = r.totals.replies > 0
+        table.append([name, *[percent_cell(shown[n][index] if n in r.percents else None) for n in window_names],
+                      str(r.totals.replies),
+                      human(r.totals.total), money(dollars(r.totals)) if used else dim("$0.00"),
+                      time_label(r.totals.last) if used else dim("not used")])
+    if limits:
+        table.append([dim("Chats & other apps"), *[percent_cell(shown[n][-1]) for n in window_names],
+                      dim("–"), dim("–"), dim("–"), dim("–")])
+    account = [f"{round(w.percent, 1):.1f}%" for w in (limits.windows if limits else ())]
+    footer = ["Account", *account, str(overall.replies), human(overall.total), dollars(overall),
+              time_label(overall.last) if overall.replies else "–"]
+    print()
+    box(header, table, set(range(1, len(header) - 1)), footer)
+    print()
+
+
 def report(hosts: list[str], since: datetime, period: str, by: str, as_json: bool, with_limits: bool,
-           detail: bool) -> None:
-    targets = hosts or ["local"]
-    machines = mesh_machines() if with_limits else []
+           detail: bool, follow_week: bool) -> None:
+    all_machines = hosts == ["all"]
+    targets = ["local"] if all_machines or not hosts else hosts
+    machines = mesh_machines() if with_limits or all_machines else []
     # Read far enough back to cover the 7-day window as well as --since.
     earliest = min(since, datetime.now().astimezone() - timedelta(days=8)) if with_limits else since
 
@@ -686,6 +804,15 @@ def report(hosts: list[str], since: datetime, period: str, by: str, as_json: boo
     limits = limits_source.limits if limits_source else None
     limits_error = limits_source.limits_error if limits_source else "the machine could not be read"
     everyone = [s.replies for s in sources.values()]
+
+    if all_machines:
+        listed = machines or [Machine("local", (), True, True)]
+        week = next((w for w in limits.windows if w.name == "7-day"), None) if limits else None
+        # Without --since, cover the limit's own week so every column describes the same period.
+        if follow_week and week is not None:
+            since, period = week.starts, f"limit week since {time_label(week.starts)}"
+        print_all(listed, sources, limits, limits_error, since, period, as_json, with_limits)
+        return
 
     output: dict[str, object] = {}
     for host in targets:
@@ -745,8 +872,9 @@ def main() -> None:
         prog="tokens",
         description="Show Claude Code token usage, its API price, and a machine's share of the plan limits.",
     )
-    parser.add_argument("hosts", nargs="*", help="SSH hosts to check; 'local' or nothing means this machine")
-    parser.add_argument("--since", default="7d", help="today, 12h, 7d (default) or YYYY-MM-DD")
+    parser.add_argument("hosts", nargs="*",
+                        help="SSH hosts to check; 'local' or nothing means this machine, 'all' every machine")
+    parser.add_argument("--since", help="today, 12h, 7d or YYYY-MM-DD (default: 7d; for 'all', the limit week)")
     parser.add_argument("--by", choices=GROUPINGS, default="day", help="how to group rows (default: day)")
     parser.add_argument("--json", action="store_true", help="print JSON instead of text")
     parser.add_argument("--detail", action="store_true",
@@ -755,14 +883,15 @@ def main() -> None:
                         help="skip the plan limits, which read every machine on the tailnet")
     parser.add_argument("--watch", type=int, metavar="SECONDS", help="refresh every SECONDS until Ctrl+C")
     args = parser.parse_args()
+    since_value = args.since or "7d"
     try:
-        since = parse_since(args.since)
+        since = parse_since(since_value)
     except argparse.ArgumentTypeError as error:
         parser.error(f"--since: {error}")
 
     def run() -> None:
-        report(args.hosts, since, period_label(args.since), args.by, args.json,
-               with_limits=not args.no_limits, detail=args.detail)
+        report(args.hosts, since, period_label(since_value), args.by, args.json,
+               with_limits=not args.no_limits, detail=args.detail, follow_week=args.since is None)
 
     if args.watch is None:
         run()
