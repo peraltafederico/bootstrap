@@ -195,6 +195,15 @@ check_peer() {
       ;;
   esac
 
+  if [ "$os" = windows ]; then
+    if "$TS" ping -c 1 --timeout 3s "$ip" > /dev/null 2>&1; then
+      echo "Windows, reachable; wake does not support Windows"
+    else
+      echo "Windows, not answering"
+    fi
+    return
+  fi
+
   if [ "$os" = iOS ] || [ "$os" = android ]; then
     if "$TS" ping -c 1 --timeout 3s "$ip" > /dev/null 2>&1; then
       echo "phone, reachable; phones cannot be woken remotely"

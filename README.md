@@ -98,6 +98,37 @@ Bootstrap never replaces a real `~/.codex/AGENTS.md` or a real skill inside
 would sync as dead links. The `.stignore` is not synced itself, so ignore-list
 changes reach a machine when bootstrap re-runs there.
 
+## Windows machines
+
+A Windows machine only receives SSH: it trusts the mesh keys but publishes no key
+of its own, so it cannot log into the other machines. `bootstrap.sh` does not run
+there; set it up from an elevated PowerShell instead.
+
+1. Install the OpenSSH server and open port 22:
+   ```powershell
+   Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0; Set-Service sshd -StartupType Automatic; Start-Service sshd; New-NetFirewallRule -Name sshd -DisplayName "OpenSSH Server" -Protocol TCP -LocalPort 22 -Action Allow
+   ```
+2. Install keysync, which syncs now and every 15 minutes as SYSTEM:
+   ```powershell
+   irm https://raw.githubusercontent.com/peraltafederico/bootstrap/main/keysync.ps1 -OutFile keysync.ps1; powershell -ExecutionPolicy Bypass -File .\keysync.ps1 -Install
+   ```
+   Admin accounts log in with `C:\ProgramData\ssh\administrators_authorized_keys`,
+   which sshd ignores unless only Administrators and SYSTEM can access it;
+   keysync resets those permissions on every write.
+3. Install Tailscale with `TS_UNATTENDEDMODE=always` so it stays up with nobody
+   logged in.
+
+Windows accounts are rarely called `fperalta`, so give each Windows host its user
+in `~/.ssh/config` on the machines that reach it:
+
+```
+Host federicos-windows
+  User crono
+```
+
+`keysync --all` runs `keysync.ps1` on Windows peers; `wake` reports them but
+cannot wake them.
+
 ## Removing a machine
 
 Delete its key at <https://github.com/settings/keys>. Every machine drops it on
