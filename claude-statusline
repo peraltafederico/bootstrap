@@ -304,16 +304,32 @@ class Devices:
     other: float
     machines: list[Device]
     age: float
+    # Month to date across every machine that was read, at API prices.
+    month_usd: float
+    month_tokens: int
+
+
+def month_start() -> datetime:
+    return datetime.now().astimezone().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 def read_devices(tokens: Tokens | None) -> Devices | None:
     cache = CACHE / "devices.json"
-    if tokens:
-        refresh(cache, DEVICES_TTL, [sys.executable, str(tokens.path), "all", "--json"])
-    cache_age = age(cache)
+    start = month_start()
     try:
         payload = as_dict(json.loads(cache.read_text()))
     except (OSError, ValueError):
+        payload = {}
+    # Costs cover the month; the weekly shares follow the limit window whatever --since says.
+    try:
+        current = datetime.fromisoformat(as_str(payload.get("period_start"))) == start
+    except ValueError:
+        current = False
+    if tokens:
+        refresh(cache, DEVICES_TTL if current else 0,
+                [sys.executable, str(tokens.path), "all", "--json", "--since", start.date().isoformat()])
+    cache_age = age(cache)
+    if not payload:
         return None
     week = next((as_dict(w) for w in as_list(payload.get("limits")) if as_dict(w).get("window") == "7-day"), {})
     machines = [as_dict(m) for m in as_list(payload.get("machines"))]
@@ -334,6 +350,8 @@ def read_devices(tokens: Tokens | None) -> Devices | None:
         machines=[Device(as_str(m.get("name")), m.get("here") is True, as_str(m.get("status")), s)
                   for m, s in zip(machines, shares, strict=True)],
         age=cache_age or 0.0,
+        month_usd=sum(as_float(m.get("api_usd")) or 0.0 for m in machines) if current else 0.0,
+        month_tokens=sum(int(as_float(m.get("tokens")) or 0) for m in machines) if current else 0,
     )
 
 
@@ -373,6 +391,10 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
                      + (paint(f" resets {when}", DIM) if when else ""))
     if devices and devices.plan:
         parts.append(paint(devices.plan, DIM))
+    if devices and devices.month_tokens:
+        month = f"{month_start():%b}"
+        parts.append(f"{paint(month, DIM)} {paint(f'${devices.month_usd:,.2f}', GREEN)} "
+                     f"{paint(compact(devices.month_tokens) + ' tok', DIM)}")
     return SEP.join(parts)
 
 

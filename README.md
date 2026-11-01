@@ -100,9 +100,10 @@ Needs `python3` on the machine running it and on macOS or Linux machines it read
 1. Model, effort, context as a `███░░░░░░░` bar with tokens used, compactions in this session,
    the session's API-priced cost, and whether the prompt cache is still warm (with what a
    re-cache would cost against a cache hit).
-2. The account's 5-hour and weekly limits as bars, with reset times. The magenta part of the
-   weekly bar is this machine's share.
-3. Every machine's share of the weekly limit, from `tokens all --json`.
+2. The account's 5-hour (hidden when no window is open) and weekly limits as bars, with reset
+   times, then this month's cost at API prices and tokens across every machine. The magenta part
+   of the weekly bar is this machine's share.
+3. Every machine's share of the weekly limit, this machine first, from `tokens all --json`.
 4. Folder, git branch, worktree and the branch's PR (a link).
 
 Lines 1 and 2 come from what Claude Code sends the script, so they are always current. Reading
