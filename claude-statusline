@@ -304,30 +304,27 @@ class Devices:
     other: float
     machines: list[Device]
     age: float
-    # Month to date across every machine that was read, at API prices.
-    month_usd: float
-    month_tokens: int
-
-
-def month_start() -> datetime:
-    return datetime.now().astimezone().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # Since the plan last renewed, across every machine that was read, at API prices.
+    cycle_usd: float
+    cycle_tokens: int
+    renews: datetime | None
 
 
 def read_devices(tokens: Tokens | None) -> Devices | None:
     cache = CACHE / "devices.json"
-    start = month_start()
     try:
         payload = as_dict(json.loads(cache.read_text()))
     except (OSError, ValueError):
         payload = {}
-    # Costs cover the month; the weekly shares follow the limit window whatever --since says.
+    # Costs cover the billing cycle; the weekly shares follow the limit window whatever --since says.
     try:
-        current = datetime.fromisoformat(as_str(payload.get("period_start"))) == start
+        renews: datetime | None = datetime.fromisoformat(as_str(payload.get("period_end")))
     except ValueError:
-        current = False
+        renews = None
+    current = renews is not None and renews > datetime.now().astimezone()
     if tokens:
         refresh(cache, DEVICES_TTL if current else 0,
-                [sys.executable, str(tokens.path), "all", "--json", "--since", start.date().isoformat()])
+                [sys.executable, str(tokens.path), "all", "--json", "--since", "cycle"])
     cache_age = age(cache)
     if not payload:
         return None
@@ -350,8 +347,9 @@ def read_devices(tokens: Tokens | None) -> Devices | None:
         machines=[Device(as_str(m.get("name")), m.get("here") is True, as_str(m.get("status")), s)
                   for m, s in zip(machines, shares, strict=True)],
         age=cache_age or 0.0,
-        month_usd=sum(as_float(m.get("api_usd")) or 0.0 for m in machines) if current else 0.0,
-        month_tokens=sum(int(as_float(m.get("tokens")) or 0) for m in machines) if current else 0,
+        cycle_usd=sum(as_float(m.get("api_usd")) or 0.0 for m in machines) if current else 0.0,
+        cycle_tokens=sum(int(as_float(m.get("tokens")) or 0) for m in machines) if current else 0,
+        renews=renews if current else None,
     )
 
 
@@ -391,10 +389,10 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
                      + (paint(f" resets {when}", DIM) if when else ""))
     if devices and devices.plan:
         parts.append(paint(devices.plan, DIM))
-    if devices and devices.month_tokens:
-        month = f"{month_start():%b}"
-        parts.append(f"{paint(month, DIM)} {paint(f'${devices.month_usd:,.2f}', GREEN)} "
-                     f"{paint(compact(devices.month_tokens) + ' tok', DIM)}")
+    if devices and devices.renews:
+        parts.append(f"{paint('cycle', DIM)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
+                     f"{paint(compact(devices.cycle_tokens) + ' tok', DIM)} "
+                     f"{paint(f'renews {moment(devices.renews)}', DIM)}")
     return SEP.join(parts)
 
 

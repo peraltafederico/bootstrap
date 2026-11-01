@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 GROUPINGS = ("day", "model", "session", "project")
 LIMITS_MARK = "#tokens-limits "
@@ -69,6 +71,8 @@ HAIKU_5_5_LONG_PROMPT = 100_000
 CACHE_WRITE_5M = 1.25
 CACHE_WRITE_1H = 2.0
 FAST_MODE = 2.0
+# A billing cycle is at most 31 days, so reading 32 days back always covers it.
+CYCLE_READ = timedelta(days=32)
 
 
 @dataclass(frozen=True)
@@ -166,6 +170,8 @@ class Limits:
     windows: tuple[Window, ...]
     # Part of the account's usage that comes from Claude Code rather than chats or other apps.
     claude_code_fraction: float
+    # When the subscription started; monthly renewals fall on the same day and time.
+    subscribed: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -270,6 +276,13 @@ try:
         "Authorization": "Bearer " + oauth["accessToken"], "anthropic-beta": "oauth-2025-04-20"})
     with urllib.request.urlopen(request, timeout=15) as response:
         out = {"plan": oauth.get("rateLimitTier") or oauth.get("subscriptionType") or "", "usage": json.load(response)}
+    try:
+        request = urllib.request.Request("https://api.anthropic.com/api/oauth/profile", headers={
+            "Authorization": "Bearer " + oauth["accessToken"], "anthropic-beta": "oauth-2025-04-20"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            out["subscribed"] = (json.load(response).get("organization") or {}).get("subscription_created_at")
+    except Exception:
+        pass
 except Exception as error:
     out = {"error": str(error) or type(error).__name__}
 print("#tokens-limits " + json.dumps(out))
@@ -285,6 +298,11 @@ try {
   $usage = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/usage' -TimeoutSec 15 -Headers @{
     Authorization = "Bearer $($oauth.accessToken)"; 'anthropic-beta' = 'oauth-2025-04-20' }
   $out = @{ plan = "$($oauth.rateLimitTier)"; usage = $usage }
+  try {
+    $profile = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/profile' -TimeoutSec 15 -Headers @{
+      Authorization = "Bearer $($oauth.accessToken)"; 'anthropic-beta' = 'oauth-2025-04-20' }
+    $out.subscribed = "$($profile.organization.subscription_created_at)"
+  } catch { }
 } catch { $out = @{ error = "$($_.Exception.Message)" } }
 [Console]::Out.WriteLine('#tokens-limits ' + ($out | ConvertTo-Json -Depth 10 -Compress))
 """
@@ -389,7 +407,7 @@ def parse_limits(payload: str) -> tuple[Limits | None, str]:
         None,
     )
     fraction = 1.0 if claude_code is None else claude_code / 100
-    return Limits(plan_label(as_str(data.get("plan"))), tuple(windows), fraction), ""
+    return Limits(plan_label(as_str(data.get("plan"))), tuple(windows), fraction, as_time(data.get("subscribed"))), ""
 
 
 def plan_label(tier: str) -> str:
@@ -397,6 +415,19 @@ def plan_label(tier: str) -> str:
     if not match:
         return tier or "unknown plan"
     return " ".join(part for part in (match.group(1).title(), match.group(2) or "") if part)
+
+
+def billing_cycle(subscribed: datetime, now: datetime) -> tuple[datetime, datetime]:
+    """The monthly billing period holding now. A short month renews on its last day."""
+    def renewal(year: int, month: int) -> datetime:
+        year, month = year + (month - 1) // 12, (month - 1) % 12 + 1
+        day = min(subscribed.day, calendar.monthrange(year, month)[1])
+        return subscribed.replace(year=year, month=month, day=day)
+
+    start = renewal(now.year, now.month)
+    if start > now:
+        start = renewal(now.year, now.month - 1)
+    return start, renewal(start.year, start.month + 1)
 
 
 def read_source(host: str, cutoff: datetime, with_limits: bool) -> Source:
@@ -662,7 +693,7 @@ def percent_cell(value: float | None) -> str:
 
 
 def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limits | None, limits_error: str,
-              since: datetime, period: str, as_json: bool, with_limits: bool) -> None:
+              since: datetime, period_end: datetime | None, period: str, as_json: bool, with_limits: bool) -> None:
     """One table with a row per machine, plus the account's limits."""
     everyone = [s.replies for s in sources.values()]
     window_names = [w.name for w in limits.windows] if limits else []
@@ -705,6 +736,7 @@ def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limit
     if as_json:
         print(json.dumps({
             "period_start": since.isoformat(),
+            "period_end": period_end.isoformat() if period_end else None,
             "plan": limits.plan if limits else None,
             "limits": [{"window": w.name, "account_percent": w.percent, "other_apps_percent": other[w.name],
                         "resets": w.resets.isoformat()} for w in (limits.windows if limits else ())],
@@ -762,7 +794,7 @@ def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limit
 
 
 def report(hosts: list[str], since: datetime, period: str, by: str, as_json: bool, with_limits: bool,
-           detail: bool, follow_week: bool) -> None:
+           detail: bool, follow: Literal["week", "cycle"] | None) -> None:
     all_machines = hosts == ["all"]
     targets = ["local"] if all_machines or not hosts else hosts
     machines = mesh_machines() if with_limits or all_machines else []
@@ -805,14 +837,22 @@ def report(hosts: list[str], since: datetime, period: str, by: str, as_json: boo
     limits = limits_source.limits if limits_source else None
     limits_error = limits_source.limits_error if limits_source else "the machine could not be read"
     everyone = [s.replies for s in sources.values()]
+    period_end: datetime | None = None
+    if follow == "cycle":
+        if limits is None or limits.subscribed is None:
+            print(f"tokens: the renewal date is unknown ({limits_error or 'no subscription date'}); "
+                  f"showing the last {CYCLE_READ.days} days", file=sys.stderr)
+        else:
+            since, period_end = billing_cycle(limits.subscribed, datetime.now().astimezone())
+            period = f"billing cycle {time_label(since)} – renews {time_label(period_end)}"
 
     if all_machines:
         listed = machines or [Machine("local", (), True, True)]
         week = next((w for w in limits.windows if w.name == "7-day"), None) if limits else None
         # Without --since, cover the limit's own week so every column describes the same period.
-        if follow_week and week is not None:
+        if follow == "week" and week is not None:
             since, period = week.starts, f"limit week since {time_label(week.starts)}"
-        print_all(listed, sources, limits, limits_error, since, period, as_json, with_limits)
+        print_all(listed, sources, limits, limits_error, since, period_end, period, as_json, with_limits)
         return
 
     output: dict[str, object] = {}
@@ -845,8 +885,8 @@ def report(hosts: list[str], since: datetime, period: str, by: str, as_json: boo
 
 
 def period_label(value: str) -> str:
-    if value == "today":
-        return "today"
+    if value in ("today", "cycle"):
+        return value
     match = re.fullmatch(r"(\d+)([hd])", value)
     if match:
         amount, unit = int(match.group(1)), "hour" if match.group(2) == "h" else "day"
@@ -858,6 +898,8 @@ def parse_since(value: str) -> datetime:
     today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     if value == "today":
         return today
+    if value == "cycle":  # narrowed to the exact cycle once the subscription date is read
+        return datetime.now().astimezone() - CYCLE_READ
     match = re.fullmatch(r"(\d+)([hd])", value)
     if match:
         amount, unit = int(match.group(1)), match.group(2)
@@ -865,7 +907,7 @@ def parse_since(value: str) -> datetime:
     try:
         return datetime.strptime(value, "%Y-%m-%d").astimezone()
     except ValueError:
-        raise argparse.ArgumentTypeError("use today, 12h, 7d or YYYY-MM-DD") from None
+        raise argparse.ArgumentTypeError("use today, 12h, 7d, YYYY-MM-DD or cycle") from None
 
 
 def main() -> None:
@@ -875,7 +917,8 @@ def main() -> None:
     )
     parser.add_argument("hosts", nargs="*",
                         help="SSH hosts to check; 'local' or nothing means this machine, 'all' every machine")
-    parser.add_argument("--since", help="today, 12h, 7d or YYYY-MM-DD (default: 7d; for 'all', the limit week)")
+    parser.add_argument("--since", help="today, 12h, 7d, YYYY-MM-DD or cycle (since the plan last renewed); "
+                                        "default: 7d, and for 'all' the limit week")
     parser.add_argument("--by", choices=GROUPINGS, default="day", help="how to group rows (default: day)")
     parser.add_argument("--json", action="store_true", help="print JSON instead of text")
     parser.add_argument("--detail", action="store_true",
@@ -889,10 +932,13 @@ def main() -> None:
         since = parse_since(since_value)
     except argparse.ArgumentTypeError as error:
         parser.error(f"--since: {error}")
+    if since_value == "cycle" and args.no_limits:
+        parser.error("--since cycle reads the renewal date with the limits, so it cannot be used with --no-limits")
+    follow: Literal["week", "cycle"] | None = "cycle" if since_value == "cycle" else "week" if args.since is None else None
 
     def run() -> None:
         report(args.hosts, since, period_label(since_value), args.by, args.json,
-               with_limits=not args.no_limits, detail=args.detail, follow_week=args.since is None)
+               with_limits=not args.no_limits, detail=args.detail, follow=follow)
 
     if args.watch is None:
         run()

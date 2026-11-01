@@ -64,6 +64,7 @@ woken remotely.
 tokens                               # this machine, last 7 days, one row per day
 tokens federicos-windows             # any machine you can SSH into: macOS, Linux or Windows
 tokens all                           # every machine in one table, with its share of the limits
+tokens all --since cycle             # since the plan last renewed
 tokens federicos-desktop federicos-mac-mini --since today --by session
 tokens federicos-windows --watch 60  # refresh every minute
 tokens --detail                      # every token type per row
@@ -71,7 +72,8 @@ tokens --json                        # machine-readable
 tokens --no-limits                   # skip the plan limits (faster, reads only the named machines)
 ```
 
-`--since` takes `today`, `12h`, `7d` or a date; `--by` takes `day`, `model`, `session`
+`--since` takes `today`, `12h`, `7d`, a date, or `cycle` (the current billing month: monthly
+plans renew on the day and time the subscription started, which `tokens` reads from the account); `--by` takes `day`, `model`, `session`
 or `project`. It reads the reply logs Claude Code keeps in `~/.claude/projects` (over
 SSH for other machines, nothing is installed there) and counts each API reply once:
 input, output, cache write and cache read tokens.
@@ -101,8 +103,8 @@ Needs `python3` on the machine running it and on macOS or Linux machines it read
    the session's API-priced cost, and whether the prompt cache is still warm (with what a
    re-cache would cost against a cache hit).
 2. The account's 5-hour (hidden when no window is open) and weekly limits as bars, with reset
-   times, then this month's cost at API prices and tokens across every machine. The magenta part
-   of the weekly bar is this machine's share.
+   times, then the cost at API prices and tokens across every machine since the plan last
+   renewed, and the next renewal date. The magenta part of the weekly bar is this machine's share.
 3. Every machine's share of the weekly limit, this machine first, from `tokens all --json`.
 4. Folder, git branch, worktree and the branch's PR (a link).
 
