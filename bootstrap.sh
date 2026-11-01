@@ -541,6 +541,9 @@ main() {
   install_tool wake
   step "tokens"
   install_tool tokens
+  step "Claude Code status line"
+  install_tool claude-statusline
+  "$BIN_DIR/claude-statusline" --install || warn "claude-statusline --install failed (it needs Python 3.11 or newer)"
   ensure_key
   publish_key
   require_ssh_keys

@@ -16,6 +16,21 @@ share of the API-priced usage of every reachable machine in the same window.
 
 from __future__ import annotations
 
+import sys
+
+# macOS ships Python 3.9; this needs 3.11+, so re-run under a newer one when it is installed.
+if sys.version_info < (3, 11):  # noqa: UP036 - the guard exists for older Pythons
+    import os
+    import shutil
+
+    for _name in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _found = shutil.which(_name) or next(
+            (p for p in (f"/opt/homebrew/bin/{_name}", os.path.expanduser(f"~/.local/bin/{_name}"))
+             if os.access(p, os.X_OK)), None)
+        if _found:
+            os.execv(_found, [_found, *sys.argv])
+    sys.exit(f"{sys.argv[0]}: needs Python 3.11 or newer")
+
 import argparse
 import base64
 import calendar
@@ -24,7 +39,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor

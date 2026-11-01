@@ -8,14 +8,29 @@ detached copy of this script refreshes in the background, so a render never wait
 
 from __future__ import annotations
 
+import sys
+
+# macOS ships Python 3.9; this needs 3.11+, so re-run under a newer one when it is installed.
+if sys.version_info < (3, 11):  # noqa: UP036 - the guard exists for older Pythons
+    import os
+    import shutil
+
+    for _name in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _found = shutil.which(_name) or next(
+            (p for p in (f"/opt/homebrew/bin/{_name}", os.path.expanduser(f"~/.local/bin/{_name}"))
+             if os.access(p, os.X_OK)), None)
+        if _found:
+            os.execv(_found, [_found, *sys.argv])
+    sys.exit(f"{sys.argv[0]}: needs Python 3.11 or newer")
+
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -24,6 +39,10 @@ from pathlib import Path
 from typing import Protocol, cast
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "claude-statusline"
+# Per machine: {"then": [shell commands that also get the session JSON, e.g. Orca's status line],
+#               "devices": "pushed" when another machine copies devices.json here (see --push)}.
+CONFIG = Path.home() / ".claude" / "claude-statusline.json"
+CHAINED_TIMEOUT = 3
 DEVICES_TTL = 300
 PR_TTL = 120
 # A refresh that fails keeps its lock until it goes stale, which spaces out retries.
@@ -310,7 +329,25 @@ class Devices:
     renews: datetime | None
 
 
-def read_devices(tokens: Tokens | None) -> Devices | None:
+@dataclass(frozen=True)
+class Config:
+    then: list[str]
+    devices_pushed: bool
+
+
+def read_config() -> Config:
+    try:
+        raw = as_dict(json.loads(CONFIG.read_text()))
+    except (OSError, ValueError):
+        raw = {}
+    return Config([as_str(c) for c in as_list(raw.get("then")) if as_str(c)], raw.get("devices") == "pushed")
+
+
+def devices_command(tokens: Tokens) -> list[str]:
+    return [sys.executable, str(tokens.path), "all", "--json", "--since", "cycle"]
+
+
+def read_devices(tokens: Tokens | None, pushed: bool) -> Devices | None:
     cache = CACHE / "devices.json"
     try:
         payload = as_dict(json.loads(cache.read_text()))
@@ -322,9 +359,8 @@ def read_devices(tokens: Tokens | None) -> Devices | None:
     except ValueError:
         renews = None
     current = renews is not None and renews > datetime.now().astimezone()
-    if tokens:
-        refresh(cache, DEVICES_TTL if current else 0,
-                [sys.executable, str(tokens.path), "all", "--json", "--since", "cycle"])
+    if tokens and not pushed:
+        refresh(cache, DEVICES_TTL if current else 0, devices_command(tokens))
     cache_age = age(cache)
     if not payload:
         return None
@@ -461,21 +497,137 @@ def place_line(data: dict[str, object]) -> str:
     return SEP.join(parts)
 
 
+def chained(payload: bytes, config: Config) -> list[str]:
+    """Output of the configured extra status lines and of skills that ship a statusline.sh."""
+    commands = list(config.then)
+    if os.name != "nt":
+        skills = sorted((Path.home() / ".claude" / "skills").glob("*/statusline.sh"))
+        commands += [f"'{s}'" for s in skills if os.access(s, os.X_OK)]
+    lines: list[str] = []
+    for command in commands:
+        try:
+            result = subprocess.run(command, shell=True, input=payload, capture_output=True,
+                                    timeout=CHAINED_TIMEOUT, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        lines += [line for line in result.stdout.decode(errors="replace").splitlines() if line.strip()]
+    return lines
+
+
+def push(hosts: list[str]) -> None:
+    """Copies every machine's usage to hosts that cannot read the others themselves (cron on a hub)."""
+    tokens = load_tokens()
+    if tokens is None:
+        sys.exit("claude-statusline: tokens is not installed next to this script")
+    result = subprocess.run(devices_command(tokens), capture_output=True, check=False)
+    if result.returncode != 0:
+        sys.exit(f"claude-statusline: tokens failed: {result.stderr.decode(errors='replace')[-300:]}")
+    payload = as_dict(json.loads(result.stdout))
+    for host in hosts:
+        # Mark the receiving machine as "here", since the data was read from this one.
+        for machine in as_list(payload.get("machines")):
+            entry = as_dict(machine)
+            if isinstance(machine, dict):
+                machine["here"] = as_str(entry.get("name")) == host
+        local = CACHE / f"push-{re.sub(r'[^A-Za-z0-9._-]', '_', host)}.json"
+        CACHE.mkdir(parents=True, exist_ok=True)
+        write_atomic(local, json.dumps(payload).encode())
+        sent = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", str(local),
+                               f"{host}:.cache/claude-statusline/devices.json"], capture_output=True, check=False)
+        if sent.returncode != 0:
+            print(f"claude-statusline: copying to {host} failed: {sent.stderr.decode(errors='replace').strip()}",
+                  file=sys.stderr)
+
+
+def claude_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def remove_claude_hud() -> None:
+    """Uninstalls the claude-hud plugin, its marketplace and its config."""
+    claude = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+    for args in (["plugin", "uninstall", "claude-hud@claude-hud"], ["plugin", "marketplace", "remove", "claude-hud"]):
+        try:
+            subprocess.run([claude, *args], capture_output=True, timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    plugins = claude_dir() / "plugins"
+    for leftover in (plugins / "claude-hud", plugins / "cache" / "claude-hud", plugins / "marketplaces" / "claude-hud"):
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+def install(pushed: bool) -> None:
+    """Makes this script Claude Code's status line, keeping any other status line as a chained one."""
+    script = Path(__file__).resolve()
+    # The shebang finds python3 on macOS and Linux (and the guard above upgrades an old one); Windows needs it named.
+    ours = f'"{sys.executable}" "{script}"' if os.name == "nt" else str(script)
+    path = claude_dir() / "settings.json"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = "{}"
+    settings = as_dict(json.loads(text or "{}"))
+    previous = as_str(as_dict(settings.get("statusLine")).get("command"))
+    try:
+        raw = as_dict(json.loads(CONFIG.read_text()))
+    except (OSError, ValueError):
+        raw = {}
+    then = [as_str(c) for c in as_list(raw.get("then")) if as_str(c)]
+    is_other = previous and previous != ours and "claude-statusline" not in previous and "claude-hud" not in previous
+    if is_other and previous not in then:
+        then.append(previous)
+        print(f"claude-statusline: kept the previous status line as a chained one: {previous[:80]}")
+    raw["then"] = then
+    if pushed:
+        raw["devices"] = "pushed"
+        (CACHE).mkdir(parents=True, exist_ok=True)
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(CONFIG, (json.dumps(raw, indent=2) + "\n").encode())
+
+    remove_claude_hud()
+    # The plugin commands rewrite settings.json, so read it again before changing it.
+    try:
+        settings = as_dict(json.loads(path.read_text(encoding="utf-8") or "{}"))
+    except FileNotFoundError:
+        settings = {}
+    for key in ("enabledPlugins", "extraKnownMarketplaces"):
+        entries = settings.get(key)
+        if isinstance(entries, dict):
+            for name in [k for k in entries if "claude-hud" in str(k)]:
+                del entries[name]
+    settings["statusLine"] = {"type": "command", "command": ours, "padding": 0}
+    if path.exists():
+        shutil.copy2(path, path.with_name("settings.json.bak-statusline"))
+    write_atomic(path, (json.dumps(settings, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    print(f"claude-statusline: status line set to {ours}")
+
+
 def main() -> None:
+    if sys.argv[1:2] == ["--install"]:
+        install(pushed="--devices-pushed" in sys.argv[2:])
+        return
     if sys.argv[1:2] == ["--refresh"]:
         run_refresh(Path(sys.argv[2]), sys.argv[3], sys.argv[4:])
         return
+    if sys.argv[1:2] == ["--push"]:
+        push(sys.argv[2:])
+        return
+    # Windows pipes default to the ANSI code page, which cannot encode the bar characters.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8")
+    payload = sys.stdin.buffer.read()
     try:
-        data = as_dict(json.load(sys.stdin))
+        data = as_dict(json.loads(payload))
     except ValueError:
         data = {}
+    config = read_config()
     try:
         tokens = load_tokens()
     except Exception:  # noqa: BLE001 - a broken tokens install must not blank the status line
         tokens = None
-    devices = read_devices(tokens)
+    devices = read_devices(tokens, config.devices_pushed)
     for line in (session_line(data, tokens), limits_line(data, devices), devices_line(devices),
-                 place_line(data)):
+                 place_line(data), *chained(payload, config)):
         print(line)
 
 

@@ -108,6 +108,16 @@ Needs `python3` on the machine running it and on macOS or Linux machines it read
 3. Every machine's share of the weekly limit, this machine first, from `tokens all --json`.
 4. Folder, git branch, worktree and the branch's PR (a link).
 
+Bootstrap installs it with `claude-statusline --install`, which sets it as the status line,
+keeps any status line that was there before (like Orca's) as a chained one in
+`~/.claude/claude-statusline.json`, and removes the claude-hud plugin. Skills that ship an
+executable `statusline.sh` are chained too. The scripts need Python 3.11+; under macOS's
+Python 3.9 they re-run themselves with a newer one from Homebrew or `uv python install`.
+
+A machine that cannot reach the others (the restricted Windows laptop) is installed with
+`claude-statusline --install --devices-pushed`; the desktop copies every machine's usage to it
+every 5 minutes with `claude-statusline --push federicos-windows` from cron.
+
 Lines 1 and 2 come from what Claude Code sends the script, so they are always current. Reading
 every machine takes several seconds, so line 3 shows a cache in `~/.cache/claude-statusline` that a
 detached copy of the script refreshes at most every 5 minutes; the PR is cached for 2 minutes.
