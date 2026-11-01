@@ -2,7 +2,7 @@
 """tokens: show how many Claude Code tokens a machine has used, what they cost, and its share of the plan limits.
 
   tokens                          this machine, last 7 days, by day
-  tokens federicos-windows        a mesh machine over SSH (macOS, Linux or Windows)
+  tokens cami                     a mesh machine over SSH (macOS, Linux or Windows)
   tokens --since today --by session
   tokens all                      every machine in one table, with its share of the limits
   tokens win --watch 60           refresh every 60 seconds

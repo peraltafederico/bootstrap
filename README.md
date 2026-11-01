@@ -62,11 +62,11 @@ woken remotely.
 
 ```sh
 tokens                               # this machine, last 7 days, one row per day
-tokens federicos-windows             # any machine you can SSH into: macOS, Linux or Windows
+tokens cami                          # any machine you can SSH into: macOS, Linux or Windows
 tokens all                           # every machine in one table, with its share of the limits
 tokens all --since cycle             # since the plan last renewed
 tokens federicos-desktop federicos-mac-mini --since today --by session
-tokens federicos-windows --watch 60  # refresh every minute
+tokens cami --watch 60               # refresh every minute
 tokens --detail                      # every token type per row
 tokens --json                        # machine-readable
 tokens --no-limits                   # skip the plan limits (faster, reads only the named machines)
