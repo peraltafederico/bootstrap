@@ -101,7 +101,7 @@ Needs `python3` on the machine running it and on macOS or Linux machines it read
 
 1. Model, effort, context as a `███░░░░░░░` bar with tokens used, compactions in this session,
    the session's share of the weekly limit (at this week's percent per API dollar) and its
-   API-priced cost, and whether the prompt cache is still warm (with what a
+   API-priced cost and tokens (its subagents included, as in the cost), and whether the prompt cache is still warm (with what a
    re-cache would cost against a cache hit).
 2. Limits: the weekly limit as a bar split by machine (right above line 3, which names each
    slice); today's use of the weekly limit against today's even share of what was left at
