@@ -281,7 +281,7 @@ def context_tokens(ctx: dict[str, object]) -> float | None:
     return percent / 100 * size if percent is not None and size else None
 
 
-def session_line(data: dict[str, object], tokens: Tokens | None) -> str:
+def session_line(data: dict[str, object], tokens: Tokens | None, devices: Devices | None) -> str:
     model = as_dict(data.get("model"))
     model_id = as_str(model.get("id"))
     parts = [paint(as_str(model.get("display_name")) or model_id or "?", CYAN)]
@@ -301,7 +301,10 @@ def session_line(data: dict[str, object], tokens: Tokens | None) -> str:
     parts.append(paint(f"compactions {state.compactions}", YELLOW if state.compactions else DIM))
     cost = as_float(as_dict(data.get("cost")).get("total_cost_usd"))
     if cost is not None:
-        parts.append(paint(f"session ${cost:,.2f}", MAGENTA))
+        # The session's share of the weekly limit, at this week's percent per dollar; capped at the week.
+        share = (f"{min(cost * devices.percent_per_usd, devices.week or 0.0):.1f}% "
+                 if devices and devices.percent_per_usd is not None else "")
+        parts.append(paint(f"session {share}${cost:,.2f}", MAGENTA))
 
     if state.last_reply:
         expires = state.last_reply + state.cache_ttl
@@ -343,6 +346,8 @@ class Devices:
     # Weekly limit used since midnight, and the share of what was left at midnight that today may use.
     today_percent: float | None
     today_allowed: float | None
+    # Weekly limit percent per API-priced Claude Code dollar this week, to express a cost as limit use.
+    percent_per_usd: float | None
 
 
 @dataclass(frozen=True)
@@ -413,7 +418,13 @@ def read_devices(tokens: Tokens | None, pushed: bool) -> Devices | None:
         today_tokens=sum(int(as_float(t.get("tokens")) or 0) for t in todays) if is_today else 0,
         today_percent=today_percent,
         today_allowed=today_allowed,
+        percent_per_usd=percent_per_usd(week, account, other),
     )
+
+
+def percent_per_usd(week: dict[str, object], account: float | None, other: float) -> float | None:
+    week_usd = as_float(week.get("api_usd"))
+    return max(account - other, 0.0) / week_usd if account is not None and week_usd else None
 
 
 def daily_allowance(week: dict[str, object], account: float | None, other: float,
@@ -423,11 +434,11 @@ def daily_allowance(week: dict[str, object], account: float | None, other: float
     Today's part is the Claude Code share of the week times the fraction of its cost spent today;
     chats leave no logs, so they are assumed to be spread over the week.
     """
-    week_usd = as_float(week.get("api_usd"))
+    rate = percent_per_usd(week, account, other)
     today_usd = as_float(week.get("today_api_usd"))
-    if account is None or resets is None or not week_usd or today_usd is None:
+    if account is None or resets is None or rate is None or today_usd is None:
         return None, None
-    used_today = max(account - other, 0.0) * today_usd / week_usd
+    used_today = rate * today_usd
     now = datetime.now().astimezone()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     days_left = max((resets - midnight).total_seconds() / 86400, 1.0)
@@ -528,7 +539,7 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
             percent, resets = devices.week, devices.week_resets
         if percent is None:  # no window open right now
             continue
-        when = f"{moment(resets)} ({left(resets)})" if resets else ""
+        when = f"in {left(resets)}, {moment(resets)}" if resets else ""
         shown = week_bar(percent, devices) if key == "seven_day" and devices else bar(percent)
         windows[key] = (f"{label} {shown} {paint(f'{percent:.0f}%', level(percent))}"
                         + (paint(f" resets {when}", LABEL) if when else ""))
@@ -541,7 +552,7 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
     if devices and devices.renews:
         parts.append(f"{paint('cycle', LABEL)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
                      f"{paint(compact(devices.cycle_tokens) + ' tok', LABEL)} "
-                     f"{paint(f'renews {moment(devices.renews)} ({left(devices.renews)})', LABEL)}")
+                     f"{paint(f'renews in {left(devices.renews)}, {moment(devices.renews)}', LABEL)}")
     if devices and devices.plan:
         parts.append(paint(devices.plan, LABEL))
     return SEP.join(parts)
@@ -743,7 +754,7 @@ def main() -> None:
     except Exception:  # noqa: BLE001 - a broken tokens install must not blank the status line
         tokens = None
     devices = read_devices(tokens, config.devices_pushed)
-    for line in (session_line(data, tokens), limits_line(data, devices), devices_line(devices),
+    for line in (session_line(data, tokens, devices), limits_line(data, devices), devices_line(devices),
                  place_line(data), *chained(payload, config)):
         print(line)
 
