@@ -55,7 +55,7 @@ MINE, LABEL = "1;95", "37"
 # One color per machine, shared by its name on the device line and its slice of the week bar.
 DEVICE_COLORS = ("38;5;213", "38;5;81", "38;5;214", "38;5;120", "38;5;141", "38;5;227", "38;5;203", "38;5;45")
 APPS_COLOR = "38;5;180"
-WEEK_BAR = 20
+WEEK_BAR = BAR
 SEP = f" \033[{DIM}m·\033[0m "
 
 
