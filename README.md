@@ -106,7 +106,8 @@ Needs `python3` on the machine running it and on macOS or Linux machines it read
 2. Limits: the weekly limit as a bar split by machine (right above line 3, which names each
    slice); today's use of the weekly limit against today's even share of what was left at
    midnight (`today 6.2% of 9.5%`, yellow from 80 % of it, red when over) with today's cost at
-   API prices and tokens across every machine; the 5-hour limit as a bar (hidden when no window
+   API prices and tokens across every machine; the average per day since the week started
+   (`avg/day 11.4% $310 743M tok`, the % against the even pace of 100 / 7); the 5-hour limit as a bar (hidden when no window
    is open); the cost and tokens since the plan last renewed; then the plan. Resets and the
    renewal read `resets in 4d, Fri 00:00`. Today's percentage splits the Claude Code part of the
    week by cost; chats leave no logs, so they count as spread over the week.
