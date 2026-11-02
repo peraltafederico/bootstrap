@@ -505,8 +505,9 @@ def today_part(devices: Devices) -> str:
 
 
 def limits_line(data: dict[str, object], devices: Devices | None) -> str:
+    """Shortest window first: 5h (when open), today, week, cycle, then the plan."""
     limits = as_dict(data.get("rate_limits"))
-    parts: list[str] = []
+    windows: dict[str, str] = {}
     for key, label in (("five_hour", "5h"), ("seven_day", "week")):
         window = as_dict(limits.get(key))
         percent = as_float(window.get("used_percentage"))
@@ -518,16 +519,19 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
             continue
         when = moment(resets) if resets else ""
         shown = week_bar(percent, devices) if key == "seven_day" and devices else bar(percent)
-        parts.append(f"{label} {shown} {paint(f'{percent:.0f}%', level(percent))}"
-                     + (paint(f" resets {when}", LABEL) if when else ""))
-    if devices and devices.plan:
-        parts.append(paint(devices.plan, LABEL))
+        windows[key] = (f"{label} {shown} {paint(f'{percent:.0f}%', level(percent))}"
+                        + (paint(f" resets {when}", LABEL) if when else ""))
+    parts = [windows["five_hour"]] if "five_hour" in windows else []
     if devices and devices.today_usd is not None:
         parts.append(today_part(devices))
+    if "seven_day" in windows:
+        parts.append(windows["seven_day"])
     if devices and devices.renews:
         parts.append(f"{paint('cycle', LABEL)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
                      f"{paint(compact(devices.cycle_tokens) + ' tok', LABEL)} "
                      f"{paint(f'renews {moment(devices.renews)}', LABEL)}")
+    if devices and devices.plan:
+        parts.append(paint(devices.plan, LABEL))
     return SEP.join(parts)
 
 
