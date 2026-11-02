@@ -54,8 +54,8 @@ DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN = "90", "31", "32", "33", "34", "35
 MINE, LABEL = "1;95", "37"
 # One color per machine, shared by its name on the device line and its slice of the week bar.
 # Clear mid-tones (owner, 2026-11-01: neon was too loud, muted too hard to see), ordered so neighbors contrast:
-# orchid, orange, aquamarine, green, pink, steel blue, lavender, sand.
-DEVICE_COLORS = ("38;5;177", "38;5;215", "38;5;79", "38;5;114", "38;5;204", "38;5;68", "38;5;147", "38;5;222")
+# orchid, orange, aquamarine, green, pink, green like the context bar, lavender, sand.
+DEVICE_COLORS = ("38;5;177", "38;5;215", "38;5;79", "38;5;114", "38;5;204", GREEN, "38;5;147", "38;5;222")
 APPS_COLOR = "38;5;250"
 WEEK_BAR = BAR
 SEP = f" \033[{DIM}m·\033[0m "
@@ -448,7 +448,7 @@ def week_bar(percent: float, devices: Devices) -> str:
     used = used_devices(devices)
     shares = [d.share for d in used] + [devices.other]
     unattributed = max(percent - sum(shares), 0.0)
-    segments = [(f"1;{colors[d.name]}" if d.here else colors[d.name], d.share) for d in used]
+    segments = [(colors[d.name], d.share) for d in used]
     segments += [(APPS_COLOR, devices.other), (level(percent), unattributed)]
     filled = round(min(max(percent, 0.0), 100.0) / 100 * WEEK_BAR)
     counts = split_cells([v for _, v in segments], filled, WEEK_BAR)
@@ -484,13 +484,13 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
 def devices_line(devices: Devices | None) -> str:
     if devices is None:
         return paint("device reading every machine…", LABEL)
-    # Each machine in its own week-bar color; this machine first and bold.
+    # Each machine in its own week-bar color; this machine first.
     colors = device_colors(devices)
     used = used_devices(devices)
     parts = [paint("device", LABEL)]
     for d in used:
         text = f"{short_name(d.name)} {d.share:.1f}%"
-        parts.append(paint(text, f"1;{colors[d.name]}" if d.here else colors[d.name]))
+        parts.append(paint(text, colors[d.name]))
     parts.append(paint(f"chats & apps {devices.other:.1f}%", APPS_COLOR))
     idle = sum(1 for d in devices.machines if d.status == "ok" and d not in used)
     unread = [short_name(d.name) for d in devices.machines if d.status != "ok"]
