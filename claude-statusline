@@ -58,7 +58,7 @@ MINE, LABEL = "1;95", "37"
 DEVICE_COLORS = (MAGENTA, BLUE, "38;5;79", "38;5;114", "38;5;204", GREEN, "38;5;147", "38;5;222")
 APPS_COLOR = "38;5;250"
 WEEK_BAR = BAR
-SEP = f"  \033[{LABEL}m•\033[0m  "
+SEP = f" \033[{DIM}m·\033[0m "
 
 
 def paint(text: str, code: str) -> str:
