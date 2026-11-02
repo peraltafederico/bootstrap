@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+"""Claude Code status line: model, context, account limits, every machine's share, folder and PR.
+
+Claude Code pipes a JSON description of the session on stdin and shows what this prints.
+Slow data (every machine's usage from `tokens all`, the branch's PR) comes from a cache that a
+detached copy of this script refreshes in the background, so a render never waits on SSH or gh.
+"""
+
+from __future__ import annotations
+
+import sys
+
+# macOS ships Python 3.9; this needs 3.11+, so re-run under a newer one when it is installed.
+if sys.version_info < (3, 11):  # noqa: UP036 - the guard exists for older Pythons
+    import os
+    import shutil
+
+    for _name in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _found = shutil.which(_name) or next(
+            (p for p in (f"/opt/homebrew/bin/{_name}", os.path.expanduser(f"~/.local/bin/{_name}"))
+             if os.access(p, os.X_OK)), None)
+        if _found:
+            os.execv(_found, [_found, *sys.argv])
+    sys.exit(f"{sys.argv[0]}: needs Python 3.11 or newer")
+
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Protocol, cast
+
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "claude-statusline"
+# Per machine: {"then": [shell commands that also get the session JSON, e.g. Orca's status line],
+#               "devices": "pushed" when another machine copies devices.json here (see --push)}.
+CONFIG = Path.home() / ".claude" / "claude-statusline.json"
+CHAINED_TIMEOUT = 3
+DEVICES_TTL = 300
+PR_TTL = 120
+# A refresh that fails keeps its lock until it goes stale, which spaces out retries.
+LOCK_STALE = 120
+BAR = 10
+
+DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN = "90", "31", "32", "33", "34", "35", "36"
+# The week and device lines use brighter tones: plain magenta and dark gray were hard to read on dark themes.
+MINE, LABEL = "1;95", "37"
+# One color per machine, shared by its name on the device line and its slice of the week bar.
+# Clear mid-tones (owner, 2026-11-01: neon was too loud, muted too hard to see), ordered so neighbors contrast:
+# magenta like the session cost, blue like the path, aquamarine, green, pink, green like the context bar, lavender, sand.
+DEVICE_COLORS = (MAGENTA, BLUE, "38;5;79", "38;5;114", "38;5;204", GREEN, "38;5;147", "38;5;222")
+APPS_COLOR = "38;5;250"
+WEEK_BAR = BAR
+SEP = f" \033[{DIM}m·\033[0m "
+
+
+def paint(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if text else ""
+
+
+def link(url: str, text: str) -> str:
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
+def level(percent: float) -> str:
+    return GREEN if percent < 50 else YELLOW if percent < 80 else RED
+
+
+def bar(percent: float, mine: float = 0.0) -> str:
+    """███░░░░░░░ out of 100%, with this machine's part in magenta at the start."""
+    filled = round(min(max(percent, 0.0), 100.0) / 100 * BAR)
+    mine_cells = min(filled, max(1 if mine > 0 else 0, round(mine / 100 * BAR)))
+    return (paint("█" * mine_cells, MINE) + paint("█" * (filled - mine_cells), level(percent))
+            + paint("░" * (BAR - filled), LABEL))
+
+
+def compact(n: float) -> str:
+    for size, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if n >= size:
+            return f"{n / size:.1f}".removesuffix(".0") + suffix
+    return str(round(n))
+
+
+def as_dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def as_list(value: object) -> list[object]:
+    return cast(list[object], value) if isinstance(value, list) else []
+
+
+def as_float(value: object) -> float | None:
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
+def as_str(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+# --- shared code from tokens -------------------------------------------------------------------
+
+
+class Price(Protocol):
+    input: float
+    cache_read: float
+
+
+@dataclass(frozen=True)
+class Tokens:
+    path: Path
+    prices: dict[str, Price]
+    cache_write_5m: float
+    cache_write_1h: float
+    round_to_total: Callable[[list[float], float], list[float]]
+
+
+def load_tokens() -> Tokens | None:
+    """Prices and helpers from the tokens script installed next to this one."""
+    sibling = Path(__file__).resolve().parent / "tokens"
+    found = str(sibling) if sibling.is_file() else shutil.which("tokens")
+    if not found:
+        return None
+    loader = importlib.machinery.SourceFileLoader("tokens_cli", found)
+    spec = importlib.util.spec_from_loader("tokens_cli", loader)
+    if spec is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    # Loading a script would otherwise leave a __pycache__ folder next to it in ~/.local/bin.
+    sys.dont_write_bytecode = True
+    sys.modules["tokens_cli"] = module
+    loader.exec_module(module)
+    # tokens has no .py name, so mypy types its attributes as Any; the casts restate their real types.
+    return Tokens(
+        path=Path(found),
+        prices=cast(dict[str, Price], module.PRICES),
+        cache_write_5m=cast(float, module.CACHE_WRITE_5M),
+        cache_write_1h=cast(float, module.CACHE_WRITE_1H),
+        round_to_total=cast(Callable[[list[float], float], list[float]], module.round_to_total),
+    )
+
+
+# --- background refresh ------------------------------------------------------------------------
+
+
+def age(path: Path) -> float | None:
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def refresh(cache: Path, ttl: int, command: list[str], cwd: str | None = None, empty_on_error: bool = False) -> None:
+    """Starts a detached refresh of cache when it is older than ttl and no refresh is running."""
+    cache_age = age(cache)
+    if cache_age is not None and cache_age < ttl:
+        return
+    lock = cache.with_name(cache.name + ".lock")
+    lock_age = age(lock)
+    if lock_age is not None:
+        if lock_age < LOCK_STALE:
+            return
+        lock.unlink(missing_ok=True)
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except OSError:
+        return
+    argv = [sys.executable, str(Path(__file__).resolve()), "--refresh", str(cache),
+            "empty" if empty_on_error else "keep", *command]
+    try:
+        if os.name == "nt":
+            detached = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=detached)
+        else:
+            subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        lock.unlink(missing_ok=True)
+
+
+def run_refresh(cache: Path, on_error: str, command: list[str]) -> None:
+    """The detached half of refresh: runs command and stores its output."""
+    lock = cache.with_name(cache.name + ".lock")
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=180, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if result.returncode == 0:
+        write_atomic(cache, result.stdout)
+    elif on_error == "empty":
+        write_atomic(cache, b"")
+    else:
+        return
+    lock.unlink(missing_ok=True)
+
+
+# --- transcript --------------------------------------------------------------------------------
+
+
+@dataclass
+class Tally:
+    """Tokens in one transcript file so far, each API reply counted once."""
+
+    offset: int = 0
+    tokens: int = 0
+    # Claude Code logs a reply once per content block; consecutive lines repeat its id and usage.
+    last_key: str = ""
+    last_tokens: int = 0
+    last_finished: bool = False
+    last_output: int = 0
+
+    def count(self, entry: dict[str, object]) -> None:
+        message = as_dict(entry.get("message"))
+        usage = as_dict(message.get("usage"))
+        if not usage or as_str(message.get("model")) == "<synthetic>":
+            return
+        key = f"{as_str(message.get('id'))}:{as_str(entry.get('requestId'))}"
+        total = int(sum(as_float(usage.get(k)) or 0 for k in
+                        ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")))
+        finished, output = message.get("stop_reason") is not None, int(as_float(usage.get("output_tokens")) or 0)
+        if key == self.last_key:
+            if (finished, output) <= (self.last_finished, self.last_output):
+                return
+            self.tokens -= self.last_tokens
+        self.tokens += total
+        self.last_key, self.last_tokens, self.last_finished, self.last_output = key, total, finished, output
+
+
+SESSION_VERSION = 2
+
+
+@dataclass
+class Session:
+    """What the transcript says so far; kept per session so each render reads only new lines."""
+
+    path: str = ""
+    compactions: int = 0
+    last_reply: float = 0.0
+    cache_ttl: int = 300
+    # Per file: the transcript and its subagents' logs, whose cost Claude Code counts in the session.
+    tallies: dict[str, Tally] | None = None
+    version: int = SESSION_VERSION
+
+    @property
+    def tokens(self) -> int:
+        return sum(t.tokens for t in (self.tallies or {}).values())
+
+
+def load_tally(raw: dict[str, object]) -> Tally:
+    return Tally(offset=int(as_float(raw.get("offset")) or 0), tokens=int(as_float(raw.get("tokens")) or 0),
+                 last_key=as_str(raw.get("last_key")), last_tokens=int(as_float(raw.get("last_tokens")) or 0),
+                 last_finished=raw.get("last_finished") is True,
+                 last_output=int(as_float(raw.get("last_output")) or 0))
+
+
+def load_session(state_file: Path) -> Session:
+    """The saved state, or a fresh one when it is missing or from an older layout (counted again)."""
+    try:
+        raw = as_dict(json.loads(state_file.read_text()))
+    except (OSError, ValueError):
+        return Session()
+    if raw.get("version") != SESSION_VERSION:
+        return Session()
+    return Session(path=as_str(raw.get("path")), compactions=int(as_float(raw.get("compactions")) or 0),
+                   last_reply=as_float(raw.get("last_reply")) or 0.0,
+                   cache_ttl=int(as_float(raw.get("cache_ttl")) or 300),
+                   tallies={as_str(k): load_tally(as_dict(v)) for k, v in as_dict(raw.get("tallies")).items()})
+
+
+def new_lines(path: str, tally: Tally) -> list[dict[str, object]]:
+    """Complete JSON lines added to path since the tally last read it; restarts if the file shrank."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    if size < tally.offset:  # the file was replaced: count it again
+        tally.offset = tally.tokens = tally.last_tokens = tally.last_output = 0
+        tally.last_key, tally.last_finished = "", False
+    if size == tally.offset:
+        return []
+    with open(path, "rb") as fh:
+        fh.seek(tally.offset)
+        chunk = fh.read()
+    complete = chunk.rfind(b"\n") + 1
+    tally.offset += complete
+    entries: list[dict[str, object]] = []
+    for raw in chunk[:complete].splitlines():
+        if b'"compact_boundary"' in raw:
+            entries.append({"compact_boundary": True})
+            continue
+        if b'"usage"' not in raw or b'"assistant"' not in raw:
+            continue
+        try:
+            entry = as_dict(json.loads(raw))
+        except ValueError:
+            continue
+        if entry.get("type") == "assistant":
+            entries.append(entry)
+    return entries
+
+
+def read_session(session_id: str, transcript: str) -> Session:
+    state_file = CACHE / "sessions" / f"{re.sub(r'[^A-Za-z0-9._-]', '', session_id) or 'none'}.json"
+    state = load_session(state_file)
+    if not transcript or not os.path.exists(transcript):
+        return state
+    if state.path != transcript or state.tallies is None:
+        state = Session(path=transcript, tallies={})
+    tallies = state.tallies if state.tallies is not None else {}
+    subagents = Path(transcript).with_suffix("") / "subagents"
+    files = [transcript] + (sorted(str(f) for f in subagents.glob("*.jsonl")) if subagents.is_dir() else [])
+    changed = False
+    for path in files:
+        tally = tallies.setdefault(path, Tally())
+        before = tally.offset
+        for entry in new_lines(path, tally):
+            if path != transcript:
+                tally.count(entry)
+                continue
+            if entry.get("compact_boundary") is True:
+                state.compactions += 1
+                continue
+            tally.count(entry)
+            try:
+                state.last_reply = max(state.last_reply, datetime.fromisoformat(as_str(entry.get("timestamp"))).timestamp())
+            except ValueError:
+                pass
+            written = as_dict(as_dict(as_dict(entry.get("message")).get("usage")).get("cache_creation"))
+            if as_float(written.get("ephemeral_1h_input_tokens")):
+                state.cache_ttl = 3600
+            elif as_float(written.get("ephemeral_5m_input_tokens")):
+                state.cache_ttl = 300
+        changed = changed or tally.offset != before
+    if changed:
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(state_file, json.dumps(asdict(state)).encode())
+        except OSError:
+            pass
+    return state
+
+
+# --- lines -------------------------------------------------------------------------------------
+
+
+def context_tokens(ctx: dict[str, object]) -> float | None:
+    usage = as_dict(ctx.get("current_usage"))
+    parts = [as_float(usage.get(k)) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+    if any(p for p in parts):
+        return sum(p or 0 for p in parts)
+    percent, size = as_float(ctx.get("used_percentage")), as_float(ctx.get("context_window_size"))
+    return percent / 100 * size if percent is not None and size else None
+
+
+def session_line(data: dict[str, object], tokens: Tokens | None, devices: Devices | None) -> str:
+    model = as_dict(data.get("model"))
+    model_id = as_str(model.get("id"))
+    parts = [paint(as_str(model.get("display_name")) or model_id or "?", CYAN)]
+    effort = data.get("effort")
+    effort_level = as_str(as_dict(effort).get("level")) or as_str(effort)
+    if effort_level:
+        parts.append(paint(effort_level, MAGENTA))
+
+    ctx = as_dict(data.get("context_window"))
+    percent = as_float(ctx.get("used_percentage"))
+    used, size = context_tokens(ctx), as_float(ctx.get("context_window_size"))
+    if percent is not None:
+        amount = paint(f" {compact(used)}/{compact(size)}", DIM) if used and size else ""
+        parts.append(f"ctx {bar(percent)} {paint(f'{percent:.0f}%', level(percent))}{amount}")
+
+    state = read_session(as_str(data.get("session_id")), as_str(data.get("transcript_path")))
+    parts.append(paint(f"compactions {state.compactions}", YELLOW if state.compactions else DIM))
+    cost = as_float(as_dict(data.get("cost")).get("total_cost_usd"))
+    if cost is not None:
+        # The session's share of the weekly limit, at this week's percent per dollar; capped at the week.
+        share = (f"{min(cost * devices.percent_per_usd, devices.week or 0.0):.1f}% "
+                 if devices and devices.percent_per_usd is not None else "")
+        used_tokens = paint(f" {compact(state.tokens)} tok", LABEL) if state.tokens else ""
+        parts.append(paint(f"session {share}${cost:,.2f}", MAGENTA) + used_tokens)
+
+    if state.last_reply:
+        expires = state.last_reply + state.cache_ttl
+        warm = time.time() < expires
+        cache = (paint(f"cache warm till {datetime.fromtimestamp(expires).strftime('%H:%M')}", GREEN) if warm
+                 else paint("cache cold", RED))
+        price = tokens.prices.get(re.sub(r"(-\d{8}|\[\w+\])$", "", model_id)) if tokens else None
+        if tokens and price and used:
+            write = tokens.cache_write_1h if state.cache_ttl == 3600 else tokens.cache_write_5m
+            cold, hot = used * price.input * write / 1e6, used * price.cache_read / 1e6
+            cache += paint(f" re-cache ≈${cold:.2f} vs ${hot:.2f}", DIM)
+        parts.append(cache)
+    return SEP.join(parts)
+
+
+@dataclass(frozen=True)
+class Device:
+    name: str
+    here: bool
+    status: str
+    share: float
+
+
+@dataclass(frozen=True)
+class Devices:
+    plan: str
+    week: float | None
+    week_resets: datetime | None
+    other: float
+    machines: list[Device]
+    age: float
+    # Since the plan last renewed, across every machine that was read, at API prices.
+    cycle_usd: float
+    cycle_tokens: int
+    renews: datetime | None
+    # Since local midnight, across every machine; None once the cache is from an earlier day.
+    today_usd: float | None
+    today_tokens: int
+    # Weekly limit used since midnight, and the share of what was left at midnight that today may use.
+    today_percent: float | None
+    today_allowed: float | None
+    # Weekly limit percent per API-priced Claude Code dollar this week, to express a cost as limit use.
+    percent_per_usd: float | None
+    # Per day since the week started (Claude Code cost and tokens across every machine), and the even pace.
+    week_days: float | None
+    week_usd: float
+    week_tokens: int
+
+
+@dataclass(frozen=True)
+class Config:
+    then: list[str]
+    devices_pushed: bool
+
+
+def read_config() -> Config:
+    try:
+        raw = as_dict(json.loads(CONFIG.read_text()))
+    except (OSError, ValueError):
+        raw = {}
+    return Config([as_str(c) for c in as_list(raw.get("then")) if as_str(c)], raw.get("devices") == "pushed")
+
+
+def devices_command(tokens: Tokens) -> list[str]:
+    return [sys.executable, str(tokens.path), "all", "--json", "--since", "cycle"]
+
+
+def read_devices(tokens: Tokens | None, pushed: bool) -> Devices | None:
+    cache = CACHE / "devices.json"
+    try:
+        payload = as_dict(json.loads(cache.read_text()))
+    except (OSError, ValueError):
+        payload = {}
+    # Costs cover the billing cycle; the weekly shares follow the limit window whatever --since says.
+    try:
+        renews: datetime | None = datetime.fromisoformat(as_str(payload.get("period_end")))
+    except ValueError:
+        renews = None
+    current = renews is not None and renews > datetime.now().astimezone()
+    if tokens and not pushed:
+        refresh(cache, DEVICES_TTL if current else 0, devices_command(tokens))
+    cache_age = age(cache)
+    if not payload:
+        return None
+    week = next((as_dict(w) for w in as_list(payload.get("limits")) if as_dict(w).get("window") == "7-day"), {})
+    machines = [as_dict(m) for m in as_list(payload.get("machines"))]
+    account = as_float(week.get("account_percent"))
+    shares = [as_float(as_dict(m.get("limit_percent")).get("7-day")) or 0.0 for m in machines]
+    other = as_float(week.get("other_apps_percent")) or 0.0
+    if account is not None and tokens:
+        *shares, other = tokens.round_to_total([*shares, other], account)
+    try:
+        resets: datetime | None = datetime.fromisoformat(as_str(week.get("resets")))
+    except ValueError:
+        resets = None
+    try:
+        today_start = datetime.fromisoformat(as_str(payload.get("today_start"))).astimezone().date()
+    except ValueError:
+        today_start = None
+    is_today = today_start == datetime.now().astimezone().date()
+    todays = [as_dict(m.get("today")) for m in machines]
+    today_percent, today_allowed = daily_allowance(week, account, other, resets) if is_today else (None, None)
+    return Devices(
+        plan=as_str(payload.get("plan")),
+        week=account,
+        week_resets=resets,
+        other=other,
+        machines=[Device(as_str(m.get("name")), m.get("here") is True, as_str(m.get("status")), s)
+                  for m, s in zip(machines, shares, strict=True)],
+        age=cache_age or 0.0,
+        cycle_usd=sum(as_float(m.get("api_usd")) or 0.0 for m in machines) if current else 0.0,
+        cycle_tokens=sum(int(as_float(m.get("tokens")) or 0) for m in machines) if current else 0,
+        renews=renews if current else None,
+        today_usd=sum(as_float(t.get("api_usd")) or 0.0 for t in todays) if is_today else None,
+        today_tokens=sum(int(as_float(t.get("tokens")) or 0) for t in todays) if is_today else 0,
+        today_percent=today_percent,
+        today_allowed=today_allowed,
+        percent_per_usd=percent_per_usd(week, account, other),
+        week_days=days_since(as_str(week.get("starts"))),
+        week_usd=as_float(week.get("api_usd")) or 0.0,
+        week_tokens=int(as_float(week.get("tokens")) or 0),
+    )
+
+
+def days_since(start: str) -> float | None:
+    """Days elapsed since an ISO time, at least one so a young window does not inflate its average."""
+    try:
+        started = datetime.fromisoformat(start)
+    except ValueError:
+        return None
+    return max((datetime.now().astimezone() - started).total_seconds() / 86400, 1.0)
+
+
+def percent_per_usd(week: dict[str, object], account: float | None, other: float) -> float | None:
+    week_usd = as_float(week.get("api_usd"))
+    return max(account - other, 0.0) / week_usd if account is not None and week_usd else None
+
+
+def daily_allowance(week: dict[str, object], account: float | None, other: float,
+                    resets: datetime | None) -> tuple[float | None, float | None]:
+    """Today's use of the weekly limit, and an even split of what was left at midnight over the days to the reset.
+
+    Today's part is the Claude Code share of the week times the fraction of its cost spent today;
+    chats leave no logs, so they are assumed to be spread over the week.
+    """
+    rate = percent_per_usd(week, account, other)
+    today_usd = as_float(week.get("today_api_usd"))
+    if account is None or resets is None or rate is None or today_usd is None:
+        return None, None
+    used_today = rate * today_usd
+    now = datetime.now().astimezone()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_left = max((resets - midnight).total_seconds() / 86400, 1.0)
+    left_at_midnight = max(100.0 - (account - used_today), 0.0)
+    return used_today, left_at_midnight / days_left
+
+
+def short_name(name: str) -> str:
+    return re.sub(r"^federicos?-", "", name)
+
+
+def moment(when: datetime) -> str:
+    """22:03 today, Thu 23:00 within a week, 12/11 (day/month) later."""
+    local = when.astimezone()
+    days = (local.date() - datetime.now().astimezone().date()).days
+    if days == 0:
+        return local.strftime("%H:%M")
+    return local.strftime("%a %H:%M") if days < 7 else f"{local.day}/{local.month}"
+
+
+def left(when: datetime) -> str:
+    """Time until a moment: 13d, 1d 22h under three days, 5h or 40m under a day."""
+    minutes = max(int((when - datetime.now().astimezone()).total_seconds() // 60), 0)
+    days, hours = minutes // 1440, minutes % 1440 // 60
+    if days >= 3:
+        return f"{days}d"
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    return f"{hours}h" if hours else f"{minutes}m"
+
+
+def ago(seconds: float) -> str:
+    return "just now" if seconds < 60 else f"{seconds / 60:.0f}m ago" if seconds < 3600 else f"{seconds / 3600:.0f}h ago"
+
+
+def device_colors(devices: Devices) -> dict[str, str]:
+    """Same color for a machine on every machine: assigned by name order across the tailnet."""
+    names = sorted(d.name for d in devices.machines)
+    return {name: DEVICE_COLORS[i % len(DEVICE_COLORS)] for i, name in enumerate(names)}
+
+
+def used_devices(devices: Devices) -> list[Device]:
+    """This machine first, the rest busiest first; idle and unread machines left out."""
+    return sorted((d for d in devices.machines if d.status == "ok" and (d.share > 0 or d.here)),
+                  key=lambda d: (not d.here, -d.share))
+
+
+def split_cells(values: list[float], cells: int, width: int) -> list[int]:
+    """Cells per value summing to cells; any value of 0.5 % or more keeps at least one cell."""
+    exact = [v / 100 * width for v in values]
+    counts = [max(1, int(e)) if v >= 0.5 and cells else int(e) for v, e in zip(values, exact, strict=True)]
+    while sum(counts) > cells:
+        counts[counts.index(max(counts))] -= 1
+    by_remainder = sorted(range(len(values)), key=lambda i: exact[i] - int(exact[i]), reverse=True)
+    i = 0
+    while sum(counts) < cells and by_remainder:
+        counts[by_remainder[i % len(by_remainder)]] += 1
+        i += 1
+    return counts
+
+
+def week_bar(percent: float, devices: Devices) -> str:
+    """The week bar split into each machine's color, then chats & apps, then any unattributed part."""
+    colors = device_colors(devices)
+    used = used_devices(devices)
+    shares = [d.share for d in used] + [devices.other]
+    unattributed = max(percent - sum(shares), 0.0)
+    segments = [(colors[d.name], d.share) for d in used]
+    segments += [(APPS_COLOR, devices.other), (level(percent), unattributed)]
+    filled = round(min(max(percent, 0.0), 100.0) / 100 * WEEK_BAR)
+    counts = split_cells([v for _, v in segments], filled, WEEK_BAR)
+    cells = "".join(paint("█" * n, color) for (color, _), n in zip(segments, counts, strict=True))
+    return cells + paint("░" * (WEEK_BAR - filled), LABEL)
+
+
+def today_part(devices: Devices) -> str:
+    """today 6.2% of 9.5% $479.55 1.2B tok: the weekly limit used today against today's even share."""
+    money = (f"{paint(f'${devices.today_usd or 0.0:,.2f}', GREEN)} "
+             f"{paint(compact(devices.today_tokens) + ' tok', LABEL)}")
+    used, allowed = devices.today_percent, devices.today_allowed
+    if used is None or allowed is None:
+        return f"{paint('today', LABEL)} {money}"
+    pace = used / allowed * 100 if allowed else 100.0
+    color = GREEN if pace < 80 else YELLOW if pace < 100 else RED
+    return f"{paint('today', LABEL)} {paint(f'{used:.1f}%', color)} {paint(f'of {allowed:.1f}%', LABEL)} {money}"
+
+
+def average_part(devices: Devices) -> str:
+    """avg/day 11.4% $310.20 790M tok since the week started; the % against the even pace of 100 / 7."""
+    if devices.week_days is None or devices.week is None or not devices.week_tokens:
+        return ""
+    days = devices.week_days
+    per_day = devices.week / days
+    pace = per_day / (100 / 7) * 100
+    color = GREEN if pace < 80 else YELLOW if pace < 100 else RED
+    return (f"{paint('avg/day', LABEL)} {paint(f'{per_day:.1f}%', color)} "
+            f"{paint(f'${devices.week_usd / days:,.2f}', GREEN)} "
+            f"{paint(compact(devices.week_tokens / days) + ' tok', LABEL)}")
+
+
+def limits_line(data: dict[str, object], devices: Devices | None) -> str:
+    """Week, today, daily average, 5h (when open), cycle, then the plan."""
+    limits = as_dict(data.get("rate_limits"))
+    windows: dict[str, str] = {}
+    for key, label in (("five_hour", "5h"), ("seven_day", "week")):
+        window = as_dict(limits.get(key))
+        percent = as_float(window.get("used_percentage"))
+        resets_at = as_float(window.get("resets_at"))
+        resets = datetime.fromtimestamp(resets_at).astimezone() if resets_at else None
+        if percent is None and key == "seven_day" and devices and devices.week is not None:
+            percent, resets = devices.week, devices.week_resets
+        if percent is None:  # no window open right now
+            continue
+        when = f"in {left(resets)}, {moment(resets)}" if resets else ""
+        shown = week_bar(percent, devices) if key == "seven_day" and devices else bar(percent)
+        windows[key] = (f"{label} {shown} {paint(f'{percent:.0f}%', level(percent))}"
+                        + (paint(f" resets {when}", LABEL) if when else ""))
+    # The week leads, right above the device line that splits it by machine.
+    parts = [windows["seven_day"]] if "seven_day" in windows else []
+    if devices and devices.today_usd is not None:
+        parts.append(today_part(devices))
+    if devices and (average := average_part(devices)):
+        parts.append(average)
+    if "five_hour" in windows:
+        parts.append(windows["five_hour"])
+    if devices and devices.renews:
+        parts.append(f"{paint('cycle', LABEL)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
+                     f"{paint(compact(devices.cycle_tokens) + ' tok', LABEL)} "
+                     f"{paint(f'renews in {left(devices.renews)}, {moment(devices.renews)}', LABEL)}")
+    if devices and devices.plan:
+        parts.append(paint(devices.plan, LABEL))
+    return SEP.join(parts)
+
+
+def devices_line(devices: Devices | None) -> str:
+    if devices is None:
+        return paint("device reading every machine…", LABEL)
+    # Each machine in its own week-bar color; this machine first.
+    colors = device_colors(devices)
+    used = used_devices(devices)
+    parts = [paint("device", LABEL)]
+    for d in used:
+        text = f"{short_name(d.name)} {d.share:.1f}%"
+        parts.append(paint(text, colors[d.name]))
+    parts.append(paint(f"chats & apps {devices.other:.1f}%", APPS_COLOR))
+    idle = sum(1 for d in devices.machines if d.status == "ok" and d not in used)
+    unread = [short_name(d.name) for d in devices.machines if d.status != "ok"]
+    if idle:
+        parts.append(paint(f"{idle} idle", LABEL))
+    if unread:
+        parts.append(paint(f"not counted: {', '.join(unread)}", YELLOW))
+    parts.append(paint(ago(devices.age), LABEL))
+    return SEP.join(parts)
+
+
+def git_branch(cwd: str) -> str:
+    try:
+        return subprocess.run(["git", "-C", cwd, "branch", "--show-current"], capture_output=True, text=True,
+                              timeout=0.5, check=False).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def pull_request(cwd: str, branch: str) -> str:
+    gh = shutil.which("gh")
+    if not gh or not branch:
+        return ""
+    key = re.sub(r"[^A-Za-z0-9._-]", "_", f"{cwd}__{branch}")
+    cache = CACHE / "prs" / f"{key}.json"
+    refresh(cache, PR_TTL, [gh, "pr", "view", "--json", "number,url,state"], cwd=cwd, empty_on_error=True)
+    try:
+        pr = as_dict(json.loads(cache.read_text() or "{}"))
+    except (OSError, ValueError):
+        return ""
+    number, url = as_float(pr.get("number")), as_str(pr.get("url"))
+    if not number or not url:
+        return ""
+    color = {"OPEN": GREEN, "MERGED": MAGENTA, "CLOSED": RED}.get(as_str(pr.get("state")), BLUE)
+    return link(url, paint(f"PR #{number:.0f}", color))
+
+
+def place_line(data: dict[str, object]) -> str:
+    workspace = as_dict(data.get("workspace"))
+    cwd = as_str(data.get("cwd")) or as_str(workspace.get("current_dir"))
+    home = str(Path.home())
+    shown = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
+    parts = [paint(shown, BLUE)]
+    branch = git_branch(cwd) if cwd else ""
+    if branch:
+        parts.append(f"⎇ {branch}")
+    worktree = as_str(workspace.get("git_worktree"))
+    if worktree:
+        parts.append(paint(f"worktree {worktree}", MAGENTA))
+    pr = pull_request(cwd, branch) if cwd else ""
+    if pr:
+        parts.append(pr)
+    return SEP.join(parts)
+
+
+def chained(payload: bytes, config: Config) -> list[str]:
+    """Output of the configured extra status lines and of skills that ship a statusline.sh."""
+    commands = list(config.then)
+    if os.name != "nt":
+        skills = sorted((Path.home() / ".claude" / "skills").glob("*/statusline.sh"))
+        commands += [f"'{s}'" for s in skills if os.access(s, os.X_OK)]
+    lines: list[str] = []
+    for command in commands:
+        try:
+            result = subprocess.run(command, shell=True, input=payload, capture_output=True,
+                                    timeout=CHAINED_TIMEOUT, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        lines += [line for line in result.stdout.decode(errors="replace").splitlines() if line.strip()]
+    return lines
+
+
+def push(hosts: list[str]) -> None:
+    """Copies every machine's usage to hosts that cannot read the others themselves (cron on a hub)."""
+    tokens = load_tokens()
+    if tokens is None:
+        sys.exit("claude-statusline: tokens is not installed next to this script")
+    result = subprocess.run(devices_command(tokens), capture_output=True, check=False)
+    if result.returncode != 0:
+        sys.exit(f"claude-statusline: tokens failed: {result.stderr.decode(errors='replace')[-300:]}")
+    payload = as_dict(json.loads(result.stdout))
+    for host in hosts:
+        # Mark the receiving machine as "here", since the data was read from this one.
+        for machine in as_list(payload.get("machines")):
+            entry = as_dict(machine)
+            if isinstance(machine, dict):
+                machine["here"] = as_str(entry.get("name")) == host
+        local = CACHE / f"push-{re.sub(r'[^A-Za-z0-9._-]', '_', host)}.json"
+        CACHE.mkdir(parents=True, exist_ok=True)
+        write_atomic(local, json.dumps(payload).encode())
+        sent = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", str(local),
+                               f"{host}:.cache/claude-statusline/devices.json"], capture_output=True, check=False)
+        if sent.returncode != 0:
+            print(f"claude-statusline: copying to {host} failed: {sent.stderr.decode(errors='replace').strip()}",
+                  file=sys.stderr)
+
+
+def claude_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def remove_claude_hud() -> None:
+    """Uninstalls the claude-hud plugin, its marketplace and its config."""
+    claude = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+    for args in (["plugin", "uninstall", "claude-hud@claude-hud"], ["plugin", "marketplace", "remove", "claude-hud"]):
+        try:
+            subprocess.run([claude, *args], capture_output=True, timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    plugins = claude_dir() / "plugins"
+    for leftover in (plugins / "claude-hud", plugins / "cache" / "claude-hud", plugins / "marketplaces" / "claude-hud"):
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+def install(pushed: bool) -> None:
+    """Makes this script Claude Code's status line, keeping any other status line as a chained one."""
+    script = Path(__file__).resolve()
+    # The shebang finds python3 on macOS and Linux (and the guard above upgrades an old one); Windows needs it named.
+    ours = f'"{sys.executable}" "{script}"' if os.name == "nt" else str(script)
+    path = claude_dir() / "settings.json"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = "{}"
+    settings = as_dict(json.loads(text or "{}"))
+    previous = as_str(as_dict(settings.get("statusLine")).get("command"))
+    try:
+        raw = as_dict(json.loads(CONFIG.read_text()))
+    except (OSError, ValueError):
+        raw = {}
+    then = [as_str(c) for c in as_list(raw.get("then")) if as_str(c)]
+    # Ours ends in the script's path (quoted on Windows); Orca's own script is claude-statusline.sh, not this.
+    is_ours = previous == ours or re.search(r"[/\\]claude-statusline\"?$", previous) is not None
+    is_other = bool(previous) and not is_ours and "claude-hud" not in previous
+    if is_other and previous not in then:
+        then.append(previous)
+        print(f"claude-statusline: kept the previous status line as a chained one: {previous[:80]}")
+    raw["then"] = then
+    if pushed:
+        raw["devices"] = "pushed"
+        (CACHE).mkdir(parents=True, exist_ok=True)
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(CONFIG, (json.dumps(raw, indent=2) + "\n").encode())
+
+    remove_claude_hud()
+    # The plugin commands rewrite settings.json, so read it again before changing it.
+    try:
+        settings = as_dict(json.loads(path.read_text(encoding="utf-8") or "{}"))
+    except FileNotFoundError:
+        settings = {}
+    for key in ("enabledPlugins", "extraKnownMarketplaces"):
+        entries = settings.get(key)
+        if isinstance(entries, dict):
+            for name in [k for k in entries if "claude-hud" in str(k)]:
+                del entries[name]
+    settings["statusLine"] = {"type": "command", "command": ours, "padding": 0}
+    if path.exists():
+        shutil.copy2(path, path.with_name("settings.json.bak-statusline"))
+    write_atomic(path, (json.dumps(settings, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    print(f"claude-statusline: status line set to {ours}")
+
+
+def main() -> None:
+    if sys.argv[1:2] == ["--install"]:
+        install(pushed="--devices-pushed" in sys.argv[2:])
+        return
+    if sys.argv[1:2] == ["--refresh"]:
+        run_refresh(Path(sys.argv[2]), sys.argv[3], sys.argv[4:])
+        return
+    if sys.argv[1:2] == ["--push"]:
+        push(sys.argv[2:])
+        return
+    # Windows pipes default to the ANSI code page, which cannot encode the bar characters.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8")
+    payload = sys.stdin.buffer.read()
+    try:
+        data = as_dict(json.loads(payload))
+    except ValueError:
+        data = {}
+    config = read_config()
+    try:
+        tokens = load_tokens()
+    except Exception:  # noqa: BLE001 - a broken tokens install must not blank the status line
+        tokens = None
+    devices = read_devices(tokens, config.devices_pushed)
+    for line in (session_line(data, tokens, devices), limits_line(data, devices), devices_line(devices),
+                 place_line(data), *chained(payload, config)):
+        print(line)
+
+
+if __name__ == "__main__":
+    main()

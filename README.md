@@ -62,16 +62,18 @@ woken remotely.
 
 ```sh
 tokens                               # this machine, last 7 days, one row per day
-tokens federicos-windows             # any machine you can SSH into: macOS, Linux or Windows
+tokens cami                          # any machine you can SSH into: macOS, Linux or Windows
 tokens all                           # every machine in one table, with its share of the limits
+tokens all --since cycle             # since the plan last renewed
 tokens federicos-desktop federicos-mac-mini --since today --by session
-tokens federicos-windows --watch 60  # refresh every minute
+tokens cami --watch 60               # refresh every minute
 tokens --detail                      # every token type per row
 tokens --json                        # machine-readable
 tokens --no-limits                   # skip the plan limits (faster, reads only the named machines)
 ```
 
-`--since` takes `today`, `12h`, `7d` or a date; `--by` takes `day`, `model`, `session`
+`--since` takes `today`, `12h`, `7d`, a date, or `cycle` (the current billing month: monthly
+plans renew on the day and time the subscription started, which `tokens` reads from the account); `--by` takes `day`, `model`, `session`
 or `project`. It reads the reply logs Claude Code keeps in `~/.claude/projects` (over
 SSH for other machines, nothing is installed there) and counts each API reply once:
 input, output, cache write and cache read tokens.
@@ -92,6 +94,39 @@ input, output, cache write and cache read tokens.
 
 Colors turn off when the output is piped or `NO_COLOR` is set; `FORCE_COLOR=1` keeps them.
 Needs `python3` on the machine running it and on macOS or Linux machines it reads limits from.
+
+## Claude Code status line
+
+`claude-statusline` is Claude Code's status line on every machine. It prints four lines:
+
+1. Model, effort, context as a `███░░░░░░░` bar with tokens used, compactions in this session,
+   the session's share of the weekly limit (at this week's percent per API dollar) and its
+   API-priced cost and tokens (its subagents included, as in the cost), and whether the prompt cache is still warm (with what a
+   re-cache would cost against a cache hit).
+2. Limits: the weekly limit as a bar split by machine (right above line 3, which names each
+   slice); today's use of the weekly limit against today's even share of what was left at
+   midnight (`today 6.2% of 9.5%`, yellow from 80 % of it, red when over) with today's cost at
+   API prices and tokens across every machine; the average per day since the week started
+   (`avg/day 11.4% $310 743M tok`, the % against the even pace of 100 / 7); the 5-hour limit as a bar (hidden when no window
+   is open); the cost and tokens since the plan last renewed; then the plan. Resets and the
+   renewal read `resets in 4d, Fri 00:00`. Today's percentage splits the Claude Code part of the
+   week by cost; chats leave no logs, so they count as spread over the week.
+3. Every machine's share of the weekly limit, this machine first, from `tokens all --json`.
+4. Folder, git branch, worktree and the branch's PR (a link).
+
+Bootstrap installs it with `claude-statusline --install`, which sets it as the status line,
+keeps any status line that was there before (like Orca's) as a chained one in
+`~/.claude/claude-statusline.json`, and removes the claude-hud plugin. Skills that ship an
+executable `statusline.sh` are chained too. The scripts need Python 3.11+; under macOS's
+Python 3.9 they re-run themselves with a newer one from Homebrew or `uv python install`.
+
+A machine that cannot reach the others (the restricted Windows laptop) is installed with
+`claude-statusline --install --devices-pushed`; the desktop copies every machine's usage to it
+every 10 minutes with `claude-statusline --push cami` from cron.
+
+Lines 1 and 2 come from what Claude Code sends the script, so they are always current. Reading
+every machine takes several seconds, so line 3 shows a cache in `~/.cache/claude-statusline` that a
+detached copy of the script refreshes at most every 5 minutes; the PR is cached for 2 minutes.
 
 ## Agent config sync
 
