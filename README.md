@@ -103,8 +103,8 @@ Needs `python3` on the machine running it and on macOS or Linux machines it read
    the session's API-priced cost, and whether the prompt cache is still warm (with what a
    re-cache would cost against a cache hit).
 2. The account's 5-hour (hidden when no window is open) and weekly limits as bars, with reset
-   times, then the cost at API prices and tokens across every machine since the plan last
-   renewed, and the next renewal date. The magenta part of the weekly bar is this machine's share.
+   times, then the cost at API prices and tokens across every machine today (since local
+   midnight) and since the plan last renewed, and the next renewal date. The magenta part of the weekly bar is this machine's share.
 3. Every machine's share of the weekly limit, this machine first, from `tokens all --json`.
 4. Folder, git branch, worktree and the branch's PR (a link).
 

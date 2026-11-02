@@ -719,21 +719,26 @@ def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limit
         machine: Machine
         status: str
         totals: Totals
+        today: Totals
         percents: dict[str, float]
 
+    midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     rows: list[Row] = []
     for m in machines:
         source = sources.get(m.name)
         status = "offline" if not m.online else "unreachable" if source is None else ""
         totals = Totals()
+        today = Totals()
         percents: dict[str, float] = {}
         if source is not None:
             for reply in source.replies:
                 if reply.when >= since:
                     totals.add(reply)
+                if reply.when >= midnight:
+                    today.add(reply)
             if limits:
                 percents = {s.window.name: s.percent for s in shares(limits, source.replies, everyone)}
-        rows.append(Row(m, status, totals, percents))
+        rows.append(Row(m, status, totals, today, percents))
     # Busiest first; machines that could not be read go last.
     rows.sort(key=lambda r: (r.status != "", -r.totals.cost, r.machine.name))
     other: dict[str, float] = {}
@@ -753,6 +758,7 @@ def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limit
         print(json.dumps({
             "period_start": since.isoformat(),
             "period_end": period_end.isoformat() if period_end else None,
+            "today_start": midnight.isoformat(),
             "plan": limits.plan if limits else None,
             "limits": [{"window": w.name, "account_percent": w.percent, "other_apps_percent": other[w.name],
                         "resets": w.resets.isoformat()} for w in (limits.windows if limits else ())],
@@ -760,6 +766,7 @@ def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limit
                           "replies": r.totals.replies,
                           "tokens": r.totals.total, "api_usd": round(r.totals.cost, 4),
                           "limit_percent": r.percents,
+                          "today": {"tokens": r.today.total, "api_usd": round(r.today.cost, 4)},
                           "last": r.totals.last.isoformat() if r.totals.replies else None} for r in rows],
         }, indent=2))
         return

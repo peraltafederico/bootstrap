@@ -337,6 +337,9 @@ class Devices:
     cycle_usd: float
     cycle_tokens: int
     renews: datetime | None
+    # Since local midnight, across every machine; None once the cache is from an earlier day.
+    today_usd: float | None
+    today_tokens: int
 
 
 @dataclass(frozen=True)
@@ -385,6 +388,12 @@ def read_devices(tokens: Tokens | None, pushed: bool) -> Devices | None:
         resets: datetime | None = datetime.fromisoformat(as_str(week.get("resets")))
     except ValueError:
         resets = None
+    try:
+        today_start = datetime.fromisoformat(as_str(payload.get("today_start"))).astimezone().date()
+    except ValueError:
+        today_start = None
+    is_today = today_start == datetime.now().astimezone().date()
+    todays = [as_dict(m.get("today")) for m in machines]
     return Devices(
         plan=as_str(payload.get("plan")),
         week=account,
@@ -396,6 +405,8 @@ def read_devices(tokens: Tokens | None, pushed: bool) -> Devices | None:
         cycle_usd=sum(as_float(m.get("api_usd")) or 0.0 for m in machines) if current else 0.0,
         cycle_tokens=sum(int(as_float(m.get("tokens")) or 0) for m in machines) if current else 0,
         renews=renews if current else None,
+        today_usd=sum(as_float(t.get("api_usd")) or 0.0 for t in todays) if is_today else None,
+        today_tokens=sum(int(as_float(t.get("tokens")) or 0) for t in todays) if is_today else 0,
     )
 
 
@@ -474,6 +485,9 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
                      + (paint(f" resets {when}", LABEL) if when else ""))
     if devices and devices.plan:
         parts.append(paint(devices.plan, LABEL))
+    if devices and devices.today_usd is not None:
+        parts.append(f"{paint('today', LABEL)} {paint(f'${devices.today_usd:,.2f}', GREEN)} "
+                     f"{paint(compact(devices.today_tokens) + ' tok', LABEL)}")
     if devices and devices.renews:
         parts.append(f"{paint('cycle', LABEL)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
                      f"{paint(compact(devices.cycle_tokens) + ' tok', LABEL)} "
