@@ -516,7 +516,7 @@ def today_part(devices: Devices) -> str:
 
 
 def limits_line(data: dict[str, object], devices: Devices | None) -> str:
-    """Shortest window first: 5h (when open), today, week, cycle, then the plan."""
+    """Week, today, 5h (when open), cycle, then the plan."""
     limits = as_dict(data.get("rate_limits"))
     windows: dict[str, str] = {}
     for key, label in (("five_hour", "5h"), ("seven_day", "week")):
@@ -532,11 +532,12 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
         shown = week_bar(percent, devices) if key == "seven_day" and devices else bar(percent)
         windows[key] = (f"{label} {shown} {paint(f'{percent:.0f}%', level(percent))}"
                         + (paint(f" resets {when}", LABEL) if when else ""))
-    parts = [windows["five_hour"]] if "five_hour" in windows else []
+    # The week leads, right above the device line that splits it by machine.
+    parts = [windows["seven_day"]] if "seven_day" in windows else []
     if devices and devices.today_usd is not None:
         parts.append(today_part(devices))
-    if "seven_day" in windows:
-        parts.append(windows["seven_day"])
+    if "five_hour" in windows:
+        parts.append(windows["five_hour"])
     if devices and devices.renews:
         parts.append(f"{paint('cycle', LABEL)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
                      f"{paint(compact(devices.cycle_tokens) + ' tok', LABEL)} "
