@@ -104,7 +104,7 @@ Needs `python3` on the machine running it and on macOS or Linux machines it read
    re-cache would cost against a cache hit).
 2. The account's 5-hour (hidden when no window is open) and weekly limits as bars, with reset
    times; today's use of the weekly limit against today's even share of what was left at
-   midnight (`today 6.2% of 9.5% (3.3% left)`, yellow from 80 % of it, red when over), with
+   midnight (`today 6.2% of 9.5%`, yellow from 80 % of it, red when over), with
    today's cost at API prices and tokens across every machine; the same since the plan last
    renewed, and the next renewal date. Today's percentage splits the Claude Code part of the
    week by cost; chats leave no logs, so they count as spread over the week. The magenta part of the weekly bar is this machine's share.

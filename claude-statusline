@@ -493,7 +493,7 @@ def week_bar(percent: float, devices: Devices) -> str:
 
 
 def today_part(devices: Devices) -> str:
-    """today 6.2% of 9.5% (3.3% left) $479.55 1.2B tok: the weekly limit used today against today's even share."""
+    """today 6.2% of 9.5% $479.55 1.2B tok: the weekly limit used today against today's even share."""
     money = (f"{paint(f'${devices.today_usd or 0.0:,.2f}', GREEN)} "
              f"{paint(compact(devices.today_tokens) + ' tok', LABEL)}")
     used, allowed = devices.today_percent, devices.today_allowed
@@ -501,10 +501,7 @@ def today_part(devices: Devices) -> str:
         return f"{paint('today', LABEL)} {money}"
     pace = used / allowed * 100 if allowed else 100.0
     color = GREEN if pace < 80 else YELLOW if pace < 100 else RED
-    remainder = allowed - used
-    note = f"{remainder:.1f}% left" if remainder >= 0 else f"{-remainder:.1f}% over"
-    return (f"{paint('today', LABEL)} {paint(f'{used:.1f}%', color)} {paint(f'of {allowed:.1f}%', LABEL)} "
-            f"{paint(f'({note})', color)} {money}")
+    return f"{paint('today', LABEL)} {paint(f'{used:.1f}%', color)} {paint(f'of {allowed:.1f}%', LABEL)} {money}"
 
 
 def limits_line(data: dict[str, object], devices: Devices | None) -> str:
