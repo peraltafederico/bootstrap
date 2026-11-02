@@ -448,6 +448,17 @@ def moment(when: datetime) -> str:
     return local.strftime("%a %H:%M") if days < 7 else f"{local:%b} {local.day}"
 
 
+def left(when: datetime) -> str:
+    """Time until a moment: 13d, 1d 22h under three days, 5h or 40m under a day."""
+    minutes = max(int((when - datetime.now().astimezone()).total_seconds() // 60), 0)
+    days, hours = minutes // 1440, minutes % 1440 // 60
+    if days >= 3:
+        return f"{days}d"
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    return f"{hours}h" if hours else f"{minutes}m"
+
+
 def ago(seconds: float) -> str:
     return "just now" if seconds < 60 else f"{seconds / 60:.0f}m ago" if seconds < 3600 else f"{seconds / 3600:.0f}h ago"
 
@@ -517,7 +528,7 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
             percent, resets = devices.week, devices.week_resets
         if percent is None:  # no window open right now
             continue
-        when = moment(resets) if resets else ""
+        when = f"{moment(resets)} ({left(resets)})" if resets else ""
         shown = week_bar(percent, devices) if key == "seven_day" and devices else bar(percent)
         windows[key] = (f"{label} {shown} {paint(f'{percent:.0f}%', level(percent))}"
                         + (paint(f" resets {when}", LABEL) if when else ""))
@@ -529,7 +540,7 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
     if devices and devices.renews:
         parts.append(f"{paint('cycle', LABEL)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
                      f"{paint(compact(devices.cycle_tokens) + ' tok', LABEL)} "
-                     f"{paint(f'renews {moment(devices.renews)}', LABEL)}")
+                     f"{paint(f'renews {moment(devices.renews)} ({left(devices.renews)})', LABEL)}")
     if devices and devices.plan:
         parts.append(paint(devices.plan, LABEL))
     return SEP.join(parts)
