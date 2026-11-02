@@ -440,12 +440,12 @@ def short_name(name: str) -> str:
 
 
 def moment(when: datetime) -> str:
-    """22:03 today, Thu 23:00 within a week, Nov 12 later."""
+    """22:03 today, Thu 23:00 within a week, 12/11 (day/month) later."""
     local = when.astimezone()
     days = (local.date() - datetime.now().astimezone().date()).days
     if days == 0:
         return local.strftime("%H:%M")
-    return local.strftime("%a %H:%M") if days < 7 else f"{local:%b} {local.day}"
+    return local.strftime("%a %H:%M") if days < 7 else f"{local.day}/{local.month}"
 
 
 def left(when: datetime) -> str:
