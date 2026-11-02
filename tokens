@@ -761,7 +761,12 @@ def print_all(machines: list[Machine], sources: dict[str, Source], limits: Limit
             "today_start": midnight.isoformat(),
             "plan": limits.plan if limits else None,
             "limits": [{"window": w.name, "account_percent": w.percent, "other_apps_percent": other[w.name],
-                        "resets": w.resets.isoformat()} for w in (limits.windows if limits else ())],
+                        "resets": w.resets.isoformat(),
+                        # Claude Code across every machine read: the whole window, and the part since midnight.
+                        "api_usd": round(sum(window_cost(s.replies, w) for s in sources.values()), 4),
+                        "today_api_usd": round(sum(r.cost() or 0.0 for s in sources.values() for r in s.replies
+                                                   if r.when >= max(midnight, w.starts)), 4)}
+                       for w in (limits.windows if limits else ())],
             "machines": [{"name": r.machine.name, "here": r.machine.is_self, "status": r.status or "ok",
                           "replies": r.totals.replies,
                           "tokens": r.totals.total, "api_usd": round(r.totals.cost, 4),

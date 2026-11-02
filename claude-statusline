@@ -340,6 +340,9 @@ class Devices:
     # Since local midnight, across every machine; None once the cache is from an earlier day.
     today_usd: float | None
     today_tokens: int
+    # Weekly limit used since midnight, and the share of what was left at midnight that today may use.
+    today_percent: float | None
+    today_allowed: float | None
 
 
 @dataclass(frozen=True)
@@ -394,6 +397,7 @@ def read_devices(tokens: Tokens | None, pushed: bool) -> Devices | None:
         today_start = None
     is_today = today_start == datetime.now().astimezone().date()
     todays = [as_dict(m.get("today")) for m in machines]
+    today_percent, today_allowed = daily_allowance(week, account, other, resets) if is_today else (None, None)
     return Devices(
         plan=as_str(payload.get("plan")),
         week=account,
@@ -407,7 +411,28 @@ def read_devices(tokens: Tokens | None, pushed: bool) -> Devices | None:
         renews=renews if current else None,
         today_usd=sum(as_float(t.get("api_usd")) or 0.0 for t in todays) if is_today else None,
         today_tokens=sum(int(as_float(t.get("tokens")) or 0) for t in todays) if is_today else 0,
+        today_percent=today_percent,
+        today_allowed=today_allowed,
     )
+
+
+def daily_allowance(week: dict[str, object], account: float | None, other: float,
+                    resets: datetime | None) -> tuple[float | None, float | None]:
+    """Today's use of the weekly limit, and an even split of what was left at midnight over the days to the reset.
+
+    Today's part is the Claude Code share of the week times the fraction of its cost spent today;
+    chats leave no logs, so they are assumed to be spread over the week.
+    """
+    week_usd = as_float(week.get("api_usd"))
+    today_usd = as_float(week.get("today_api_usd"))
+    if account is None or resets is None or not week_usd or today_usd is None:
+        return None, None
+    used_today = max(account - other, 0.0) * today_usd / week_usd
+    now = datetime.now().astimezone()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_left = max((resets - midnight).total_seconds() / 86400, 1.0)
+    left_at_midnight = max(100.0 - (account - used_today), 0.0)
+    return used_today, left_at_midnight / days_left
 
 
 def short_name(name: str) -> str:
@@ -467,6 +492,21 @@ def week_bar(percent: float, devices: Devices) -> str:
     return cells + paint("░" * (WEEK_BAR - filled), LABEL)
 
 
+def today_part(devices: Devices) -> str:
+    """today 6.2% of 9.5% (3.3% left) $479.55 1.2B tok: the weekly limit used today against today's even share."""
+    money = (f"{paint(f'${devices.today_usd or 0.0:,.2f}', GREEN)} "
+             f"{paint(compact(devices.today_tokens) + ' tok', LABEL)}")
+    used, allowed = devices.today_percent, devices.today_allowed
+    if used is None or allowed is None:
+        return f"{paint('today', LABEL)} {money}"
+    pace = used / allowed * 100 if allowed else 100.0
+    color = GREEN if pace < 80 else YELLOW if pace < 100 else RED
+    remainder = allowed - used
+    note = f"{remainder:.1f}% left" if remainder >= 0 else f"{-remainder:.1f}% over"
+    return (f"{paint('today', LABEL)} {paint(f'{used:.1f}%', color)} {paint(f'of {allowed:.1f}%', LABEL)} "
+            f"{paint(f'({note})', color)} {money}")
+
+
 def limits_line(data: dict[str, object], devices: Devices | None) -> str:
     limits = as_dict(data.get("rate_limits"))
     parts: list[str] = []
@@ -486,8 +526,7 @@ def limits_line(data: dict[str, object], devices: Devices | None) -> str:
     if devices and devices.plan:
         parts.append(paint(devices.plan, LABEL))
     if devices and devices.today_usd is not None:
-        parts.append(f"{paint('today', LABEL)} {paint(f'${devices.today_usd:,.2f}', GREEN)} "
-                     f"{paint(compact(devices.today_tokens) + ' tok', LABEL)}")
+        parts.append(today_part(devices))
     if devices and devices.renews:
         parts.append(f"{paint('cycle', LABEL)} {paint(f'${devices.cycle_usd:,.2f}', GREEN)} "
                      f"{paint(compact(devices.cycle_tokens) + ' tok', LABEL)} "

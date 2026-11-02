@@ -103,8 +103,11 @@ Needs `python3` on the machine running it and on macOS or Linux machines it read
    the session's API-priced cost, and whether the prompt cache is still warm (with what a
    re-cache would cost against a cache hit).
 2. The account's 5-hour (hidden when no window is open) and weekly limits as bars, with reset
-   times, then the cost at API prices and tokens across every machine today (since local
-   midnight) and since the plan last renewed, and the next renewal date. The magenta part of the weekly bar is this machine's share.
+   times; today's use of the weekly limit against today's even share of what was left at
+   midnight (`today 6.2% of 9.5% (3.3% left)`, yellow from 80 % of it, red when over), with
+   today's cost at API prices and tokens across every machine; the same since the plan last
+   renewed, and the next renewal date. Today's percentage splits the Claude Code part of the
+   week by cost; chats leave no logs, so they count as spread over the week. The magenta part of the weekly bar is this machine's share.
 3. Every machine's share of the weekly limit, this machine first, from `tokens all --json`.
 4. Folder, git branch, worktree and the branch's PR (a link).
 
