@@ -54,8 +54,8 @@ DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN = "90", "31", "32", "33", "34", "35
 MINE, LABEL = "1;95", "37"
 # One color per machine, shared by its name on the device line and its slice of the week bar.
 # Clear mid-tones (owner, 2026-11-01: neon was too loud, muted too hard to see), ordered so neighbors contrast:
-# orchid, orange, aquamarine, green, pink, green like the context bar, lavender, sand.
-DEVICE_COLORS = ("38;5;177", "38;5;215", "38;5;79", "38;5;114", "38;5;204", GREEN, "38;5;147", "38;5;222")
+# magenta like the session cost, orange, aquamarine, green, pink, green like the context bar, lavender, sand.
+DEVICE_COLORS = (MAGENTA, "38;5;215", "38;5;79", "38;5;114", "38;5;204", GREEN, "38;5;147", "38;5;222")
 APPS_COLOR = "38;5;250"
 WEEK_BAR = BAR
 SEP = f" \033[{DIM}m·\033[0m "
