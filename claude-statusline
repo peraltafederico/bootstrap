@@ -53,8 +53,9 @@ DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN = "90", "31", "32", "33", "34", "35
 # The week and device lines use brighter tones: plain magenta and dark gray were hard to read on dark themes.
 MINE, LABEL = "1;95", "37"
 # One color per machine, shared by its name on the device line and its slice of the week bar.
-DEVICE_COLORS = ("38;5;213", "38;5;81", "38;5;214", "38;5;120", "38;5;141", "38;5;227", "38;5;203", "38;5;45")
-APPS_COLOR = "38;5;180"
+# Muted tones (owner, 2026-11-01): soft blue, teal, sage, mauve, dusty rose, brown, slate, khaki.
+DEVICE_COLORS = ("38;5;174", "38;5;73", "38;5;137", "38;5;108", "38;5;139", "38;5;110", "38;5;66", "38;5;144")
+APPS_COLOR = "38;5;181"
 WEEK_BAR = BAR
 SEP = f" \033[{DIM}m·\033[0m "
 
